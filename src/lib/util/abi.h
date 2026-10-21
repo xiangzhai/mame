@@ -108,6 +108,8 @@
 	#define MAME_ABI_CXX_ITANIUM_MFP_TYPE MAME_ABI_CXX_ITANIUM_MFP_ARM
 #elif defined(__MIPSEL__) || defined(__mips_isa_rev) || defined(__mips64)
 	#define MAME_ABI_CXX_ITANIUM_MFP_TYPE MAME_ABI_CXX_ITANIUM_MFP_ARM
+#elif defined(__loongarch__) || defined(__loongarch64)
+	#define MAME_ABI_CXX_ITANIUM_MFP_TYPE MAME_ABI_CXX_ITANIUM_MFP_ARM
 #elif defined(__EMSCRIPTEN__)
 	#define MAME_ABI_CXX_ITANIUM_MFP_TYPE MAME_ABI_CXX_ITANIUM_MFP_ARM
 #else

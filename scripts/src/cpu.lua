@@ -21,7 +21,7 @@ for i, v in ipairs(DRC_CPUS) do
 		break
 	end
 end
-CPU_INCLUDE_DRC_NATIVE = CPU_INCLUDE_DRC and (not _OPTIONS["FORCE_DRC_C_BACKEND"]) and ((_OPTIONS["PLATFORM"] == "x86") or (_OPTIONS["PLATFORM"] == "arm64"))
+CPU_INCLUDE_DRC_NATIVE = CPU_INCLUDE_DRC and (not _OPTIONS["FORCE_DRC_C_BACKEND"]) and ((_OPTIONS["PLATFORM"] == "x86") or (_OPTIONS["PLATFORM"] == "arm64") or (_OPTIONS["PLATFORM"] == "loongarch64"))
 
 
 if CPU_INCLUDE_DRC then
@@ -44,12 +44,19 @@ if CPU_INCLUDE_DRC then
 	}
 end
 if CPU_INCLUDE_DRC_NATIVE then
-	files {
-		MAME_DIR .. "src/devices/cpu/drcbearm64.cpp",
-		MAME_DIR .. "src/devices/cpu/drcbearm64.h",
-		MAME_DIR .. "src/devices/cpu/drcbex64.cpp",
-		MAME_DIR .. "src/devices/cpu/drcbex64.h",
-	}
+	if _OPTIONS["PLATFORM"] == "loongarch64" then
+		files {
+			MAME_DIR .. "src/devices/cpu/drcbela64.cpp",
+			MAME_DIR .. "src/devices/cpu/drcbela64.h",
+		}
+	else
+		files {
+			MAME_DIR .. "src/devices/cpu/drcbearm64.cpp",
+			MAME_DIR .. "src/devices/cpu/drcbearm64.h",
+			MAME_DIR .. "src/devices/cpu/drcbex64.cpp",
+			MAME_DIR .. "src/devices/cpu/drcbex64.h",
+		}
+	end
 end
 
 --------------------------------------------------

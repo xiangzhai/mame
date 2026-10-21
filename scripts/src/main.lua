@@ -166,7 +166,7 @@ end
 	}
 if CPU_INCLUDE_DRC_NATIVE then
 	links {
-		"asmjit",
+		(_OPTIONS["PLATFORM"] == "loongarch64") and "lagoon" or "asmjit",
 	}
 end
 if (STANDALONE~=true) then

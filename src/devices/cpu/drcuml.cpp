@@ -34,6 +34,7 @@
 #include "emu.h"
 #include "drcuml.h"
 
+#include "drcbela64.h"
 #include "drcbearm64.h"
 #include "drcbec.h"
 #include "drcbex64.h"
@@ -65,6 +66,8 @@
 #define NATIVE_DRC drcbe_x64
 #elif !defined(MAME_NOASM) && (defined(__aarch64__) || defined(_M_ARM64))
 #define NATIVE_DRC drcbe_arm64
+#elif defined(__loongarch__) && (__loongarch_grlen == 64)
+#define NATIVE_DRC drcbe_la64
 #else
 #define NATIVE_DRC drcbe_c
 #endif

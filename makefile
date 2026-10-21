@@ -205,6 +205,10 @@ else ifneq ($(filter riscv64%,$(UNAME_M)),)
 PLATFORM := riscv64
 else ifneq ($(filter riscv64%,$(UNAME_P)),)
 PLATFORM := riscv64
+else ifneq ($(filter loongarch64%,$(UNAME_M)),)
+PLATFORM := loongarch64
+else ifneq ($(filter loongarch64%,$(UNAME_P)),)
+PLATFORM := loongarch64
 else ifneq ($(filter mips64%,$(UNAME_M)),)
 ifeq ($(shell getconf LONG_BIT),64)
 PLATFORM := mips64
@@ -404,6 +408,10 @@ ARCHITECTURE :=
 endif
 
 ifeq ($(findstring riscv64,$(UNAME)),riscv64)
+ARCHITECTURE :=
+endif
+
+ifeq ($(findstring loongarch64,$(UNAME)),loongarch64)
 ARCHITECTURE :=
 endif
 

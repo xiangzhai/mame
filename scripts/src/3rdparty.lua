@@ -1984,6 +1984,26 @@ project "residfp"
 
 
 --------------------------------------------------
+-- lagoon library v1.0.0 (LoongArch64 assembler)
+--------------------------------------------------
+
+if (not _OPTIONS["FORCE_DRC_C_BACKEND"]) and (_OPTIONS["PLATFORM"] == "loongarch64") then
+project "lagoon"
+	uuid "4a0d6c9d-7f5a-4f42-9a4e-51e0f6d3c2b1"
+	kind "StaticLib"
+
+	includedirs {
+		MAME_DIR .. "3rdparty/lagoon",
+	}
+
+	files {
+		MAME_DIR .. "3rdparty/lagoon/lagoon.c",
+		MAME_DIR .. "3rdparty/lagoon/lagoon.h",
+	}
+end
+
+
+--------------------------------------------------
 -- asmjit library
 --------------------------------------------------
 
