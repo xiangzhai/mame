@@ -591,10 +591,43 @@ make -j"$(nproc)" SUBTARGET=drc_condtest SOURCES=src/mame/test/drc_condtest.cpp
 
 测试驱动通过 `src/mame/mame.lst` 注册为 `drc_condtest`，并在 `scripts/src/cpu.lua` 中为这个 subtarget 显式启用 DRC 核心；测试本身不实例化 MIPS3 或其他 guest CPU。
 
+#### 9.4.6 独立的 specific 访问掩码测试与真实游戏双重校验
+
+32 位 specific 访问掩码的问题不会崩溃，只会让读取返回 0、写入被丢弃，因此仅靠“能跑完”或“退出码为 0”无法发现。现在用两个层次覆盖：
+
+1. **不依赖 guest CPU 的独立测试** `src/mame/test/drc_specifictest.cpp`：
+   - 创建一个 32 位地址空间（`native_bytes == 4`），通过 `drcuml_state` 生成 UML dword 读写。
+   - 8 个 dword 读取和 8 个 dword 写入直接检查 RAM 内容，覆盖 `0x80000000`、`0xdeadbeef`、`0xffffffff` 等高位数据。
+   - 另外用一个对掩码敏感的寄存器 handler 记录 `mem_mask`，分别断言读取和写入都收到完整的 `0xffffffff`；这比只检查 RAM 更直接，因为 RAM 读取本身可能忽略掩码。
+   - 运行方法：
+
+     ```sh
+     tests/devices/cpu/run_drc_specifictest.sh
+     ```
+
+     脚本分别运行原生后端和 `-drc_use_c`，两者都输出：
+
+     ```
+     drc_specifictest: PASS (8 dword reads + 8 dword writes + mask-sensitive register, 32-bit native space)
+     ```
+
+   - 临时把 `op_read`/`op_write` 的掩码改回 0 重新构建，测试立即报告 9 个不匹配（7 个写入数据 + 2 个掩码），退出码非 0，说明该测试确实能捕获“读错/写丢”型回归。
+
+2. **真实游戏画面与内存/寄存器双重校验** `tests/devices/cpu/run_drc_diehard_verify.sh`：
+   - 该脚本用 Lua helper `tests/devices/cpu/diehard_drc_verify.lua` 分别以原生后端和 `-drc_use_c` 运行 ST-V `diehard`。
+   - 在第 120、180、240 帧同时记录：
+     - 屏幕像素缓冲的 FNV-1a 哈希和非黑像素数量；
+     - `workram_l`、`workram_h`、sound RAM、backup RAM；
+     - VDP1 寄存器、VDP2 寄存器、VDP2 CRAM、SCU 寄存器。
+   - 两个后端的屏幕摘要必须完全一致，且非黑像素数必须大于 100（避免“两边都是黑屏也算一致”）；所有内存/寄存器 dump 必须逐字节一致。
+   - 结果：原生后端与 C 后端在 3 个帧上全部一致，输出
+     `DRC real-game verification: PASS (screen + memories/registers match at frames 120 180 240)`。
+   - 早期第 20/60 帧在当前冷启动配置下仍处于 BIOS 初始化阶段（全黑），因此校验帧从显示初始化后的第 120 帧开始。
+   - ROM 不在仓库中；缺少 `diehard.zip`/`stvbios.zip`/`segabill.zip` 时脚本会打印 `SKIP` 并返回 0。
+
 ### 9.5 后续工作
 
 - POWERPC、UNSP、ADSP(SHARC)、DSPP 的真实 ROM 回归尚未完成；拿到合法 ROM/可构建的开源测试程序后，继续按 9.4.1 的用例清单做 native vs `-drc_use_c` A/B。
-- 为 `specific_access_info` 快速路径补充 32 位读写掩码的独立测试，并在真实游戏验证中同时检查画面和关键内存/寄存器内容，避免“不崩溃但读错/写丢”的问题再次漏过。
 - 开发期建议用 `-DLA_DEBUG` 编译 `lagoon.c`，让立即数越界尽早断言。
 - 当前实现以正确性优先，未做 CMP+条件分支融合、常量折叠和分支岛等优化；后续可以在 `emit_skip`/`op_jmp` 与 CMP/TEST 上做 peephole。
 - 如需在同一个后端实例上递归 `execute()`，顶层 SP 目前保存在 near cache 中，建议后续改为保存到保留的 callee-saved 寄存器或显式保存栈，以避免递归覆盖。

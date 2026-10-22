@@ -47402,6 +47402,9 @@ sapizps3b
 @source:test/drc_condtest.cpp
 drc_condtest
 
+@source:test/drc_specifictest.cpp
+drc_specifictest
+
 @source:thomson/thomson.cpp
 mo5
 mo5e

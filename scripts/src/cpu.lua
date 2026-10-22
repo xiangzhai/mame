@@ -21,9 +21,9 @@ for i, v in ipairs(DRC_CPUS) do
 		break
 	end
 end
--- The standalone DRC condition test does not select a guest CPU, but it
--- still needs the DRC core and the native backend built in.
-if (_OPTIONS["subtarget"] == "drc_condtest") then
+-- The standalone DRC tests do not select a guest CPU, but they still need
+-- the DRC core and the native backend built in.
+if (_OPTIONS["subtarget"] == "drc_condtest") or (_OPTIONS["subtarget"] == "drc_specifictest") then
 	CPU_INCLUDE_DRC = true
 end
 CPU_INCLUDE_DRC_NATIVE = CPU_INCLUDE_DRC and (not _OPTIONS["FORCE_DRC_C_BACKEND"]) and ((_OPTIONS["PLATFORM"] == "x86") or (_OPTIONS["PLATFORM"] == "arm64") or (_OPTIONS["PLATFORM"] == "loongarch64"))
