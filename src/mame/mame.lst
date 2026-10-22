@@ -47399,6 +47399,9 @@ sapizps3
 sapizps3a
 sapizps3b
 
+@source:test/drc_condtest.cpp
+drc_condtest
+
 @source:thomson/thomson.cpp
 mo5
 mo5e

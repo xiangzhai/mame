@@ -566,10 +566,34 @@ load_imm32(a, REG_PARAM4, uint32_t((uint64_t(1) << (accessors.specific.native_by
 - **UNSP、ADSP(SHARC)、DSPP**：没有对应的合法 ROM/测试 ROM。
 - 这些前端重点使用的 `BFXU`/`BFXS`、`ROLAND`/`ROLINS`、`ROLC`/`RORC`、64 位 `DIV`/`MUL`、`SAVE`/`RESTORE`、异常路径和 `RECOVER` 已由 9.4.1 的 UML 定向用例覆盖；后续拿到 ROM 后仍需补做真实前端 A/B。
 
+#### 9.4.5 独立的 DRC 条件码标志位组合测试
+
+为避免 `COND_A`/`COND_BE` 等条件码只靠 MIPS3 或真实游戏间接覆盖，新增了不依赖任何 guest CPU 前端的测试驱动 `src/mame/test/drc_condtest.cpp`。它直接构造 `drc_cache`/`drcuml_state`，对 `COND_Z` 到 `COND_GE` 的全部 16 个条件分别用 `SETc` 和 `JMPc` 两条路径执行，并遍历 C/V/Z/S/U 的全部 32 种标志位组合，共 16 × 32 × 2 = 1024 个检查。期望值由 UML 规范中的条件定义独立计算，不经过任何 DRC 后端。
+
+运行方法：
+
+```sh
+tests/devices/cpu/run_drc_condtest.sh
+```
+
+脚本会先构建测试目标，然后分别运行原生后端和 C 后端：
+
+```sh
+make -j"$(nproc)" SUBTARGET=drc_condtest SOURCES=src/mame/test/drc_condtest.cpp
+./drc_condtest drc_condtest -video none -sound none -nothrottle
+./drc_condtest drc_condtest -video none -sound none -nothrottle -drc_use_c
+```
+
+结果：
+
+- 原生后端和 `-drc_use_c` 都输出 `drc_condtest: PASS (16 conditions x 32 flag combinations x 2 paths)`。
+- 临时把 `COND_A`/`COND_BE` 改回修复前的实现重新构建，测试立即报告 64 个不匹配（`COND_A` 和 `COND_BE` 各 16 种标志组合 × 2 条路径），说明该测试确实能捕获这次回归。
+
+测试驱动通过 `src/mame/mame.lst` 注册为 `drc_condtest`，并在 `scripts/src/cpu.lua` 中为这个 subtarget 显式启用 DRC 核心；测试本身不实例化 MIPS3 或其他 guest CPU。
+
 ### 9.5 后续工作
 
 - POWERPC、UNSP、ADSP(SHARC)、DSPP 的真实 ROM 回归尚未完成；拿到合法 ROM/可构建的开源测试程序后，继续按 9.4.1 的用例清单做 native vs `-drc_use_c` A/B。
-- 为 `COND_A`/`COND_BE` 等条件码补充独立的标志位组合测试，避免只靠 MIPS3 用例覆盖。
 - 为 `specific_access_info` 快速路径补充 32 位读写掩码的独立测试，并在真实游戏验证中同时检查画面和关键内存/寄存器内容，避免“不崩溃但读错/写丢”的问题再次漏过。
 - 开发期建议用 `-DLA_DEBUG` 编译 `lagoon.c`，让立即数越界尽早断言。
 - 当前实现以正确性优先，未做 CMP+条件分支融合、常量折叠和分支岛等优化；后续可以在 `emit_skip`/`op_jmp` 与 CMP/TEST 上做 peephole。
