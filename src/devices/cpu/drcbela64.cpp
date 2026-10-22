@@ -712,6 +712,7 @@ void drcbe_la64::emit_condition(lagoon_assembler_t &a, uml::condition_t cond, la
 
 	case uml::COND_A:
 		la_andi(&a, dst, FLAGS_REG, uml::FLAG_C);
+		la_xori(&a, dst, dst, 1);
 		la_srli_d(&a, LA_T3, FLAGS_REG, uml::FLAG_BIT_Z);
 		la_andi(&a, LA_T3, LA_T3, 1);
 		la_xori(&a, LA_T3, LA_T3, 1);
@@ -721,9 +722,7 @@ void drcbe_la64::emit_condition(lagoon_assembler_t &a, uml::condition_t cond, la
 		la_andi(&a, dst, FLAGS_REG, uml::FLAG_C);
 		la_srli_d(&a, LA_T3, FLAGS_REG, uml::FLAG_BIT_Z);
 		la_andi(&a, LA_T3, LA_T3, 1);
-		la_xori(&a, LA_T3, LA_T3, 1);
-		la_and(&a, dst, dst, LA_T3);
-		la_xori(&a, dst, dst, 1);
+		la_or(&a, dst, dst, LA_T3);
 		break;
 
 	case uml::COND_G:

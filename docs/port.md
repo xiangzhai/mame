@@ -2,7 +2,7 @@
 
 ## 0. 结论与前提
 
-> **实施状态：已完成。** 后端位于 `src/devices/cpu/drcbela64.{h,cpp}`，使用 lagoon v1.0.0，已接入构建并完成 MIPS3 整数/浮点 A/B 回归；详细改动和验证结果见第 9 节。
+> **实施状态：已完成。** 后端位于 `src/devices/cpu/drcbela64.{h,cpp}`，使用 lagoon v1.0.0，已接入构建，完成 MIPS3 整数/浮点 A/B 回归，并通过 STV/SH-2 游戏 `diehard` 实测确认原生 JIT 实际执行；详细改动和验证结果见第 9 节。
 
 可以移植，但这是一项大工程：现有 ARM64 后端 5.7k 行、x86-64 后端 6.6k 行，LoongArch64 后端大概也要 4–5k 行。指令编码器不需要自己写，直接用 Loongson 社区的 `lagoon` 汇编/反汇编库（见第 4 节）。
 
@@ -421,7 +421,11 @@ src/lib/util/abi.h               # 修正 LoongArch 成员函数指针布局
 
 ### 9.3 验证环境与方法
 
-验证使用临时编写的 MIPS R4600BE 测试驱动（`-drc_use_c` 与原生后端 A/B 对比），程序放在物理 `0x1fc00000`（MIPS 复位向量对应的物理地址），RAM 映射在物理 `0x00000000`，通过定时器读取结果并打印。临时测试驱动在验证完成后已删除，不进入仓库。
+验证分为 MIPS3 合成 A/B 对比和真实游戏实测两部分。
+
+#### 9.3.1 MIPS3 A/B 对比
+
+MIPS3 验证使用临时编写的 MIPS R4600BE 测试驱动（`-drc_use_c` 与原生后端 A/B 对比），程序放在物理 `0x1fc00000`（MIPS 复位向量对应的物理地址），RAM 映射在物理 `0x00000000`，通过定时器读取结果并打印。临时测试驱动在验证完成后已删除，不进入仓库。
 
 对比覆盖的 UML 路径包括：
 
@@ -430,14 +434,48 @@ src/lib/util/abi.h               # 修正 LoongArch 成员函数指针布局
 - 内存：LB/LBU/LH/LHU/LW/LD、SB/SH/SW/SD，覆盖 READ/WRITE 的通用路径和原生宽度快速路径。
 - 浮点：`add.s`/`add.d`、`div.s`、`cvt.s.d`/`cvt.d.s`、`trunc.w.s`、`cvt.s.w`、`c.lt.s`/`bc1t`，以及 `mtc1`/`mfc1`/`dmtc1`/`dmfc1` 的单/双精度寄存器搬运。
 
-最终 51 个 32 位结果字全部与 C 后端一致，包括乘法高低位、除法商余数、移位/符号扩展、字节/半字加载、浮点运算和比较分支。验证过程中发现并修复了两个关键问题：
+最终 51 个 32 位结果字全部与 C 后端一致，包括乘法高低位、除法商余数、移位/符号扩展、字节/半字加载、浮点运算和比较分支。MIPS3 A/B 验证过程中发现并修复了两个关键问题：
 
 1. `m_exit` 未先把 `$sp` 恢复到顶层帧，导致在 `CALLH` 帧内执行 `EXIT` 时从错误位置恢复 `$ra`，表现为跳转到 near cache/`m_baseptr` 后崩溃。修复后正常退出。
 2. `abi.h` 未把 LoongArch 识别为 ARM 式成员函数指针布局，导致 `specific_access_info` 的虚拟函数入口解析错误；修复后具体内存访问快速路径正常工作。
 
+#### 9.3.2 STV/SH-2 游戏实测
+
+为确认原生后端不只是“能生成代码”，而是真的在游戏执行路径上运行，使用 Sega ST-V 游戏 `diehard`（SH7604/SH-2，DRC 前端）做了实测。测试 ROM 为 `diehard.zip`、`stvbios.zip`、`segabill.zip`，放在 `roms/` 下。命令：
+
+```sh
+./mame diehard -rompath roms -video none -sound none -nothrottle -seconds_to_run 30
+./mame diehard -rompath roms -video none -sound none -nothrottle -seconds_to_run 8 -drc_log_native
+./mame diehard -rompath roms -video none -sound none -nothrottle -seconds_to_run 8 -drc_use_c
+```
+
+结果：
+
+- 原生后端：30 秒游戏时间正常退出，退出码 0，平均速度约 176%。
+- `-drc_use_c`：同配置平均速度约 55%，可作为“未走原生 JIT”的对照。
+- `-drc_log_native` 生成 `drcbela64_sh2_7604_maincpu.asm`（约 13.5 MB、194365 条指令）和 `drcbela64_sh2_7604_slave.asm`。
+- 用 GDB 在 `drcbe_la64::execute` 下断点，实际命中，调用栈为：
+
+```
+#0 drc::(anonymous namespace)::drcbe_la64::execute(uml::code_handle&)
+#1 sh_common_execution::execute_run_drc()
+#2 device_scheduler::timeslice()
+...
+```
+
+这直接证明 `diehard` 的 SH-2 执行走的是 `drcbe_la64` 生成的 LoongArch64 原生代码，而不是 C 后端。
+
+首次实测时游戏在 SH-2 写内存的 fastram 快速路径上段错误，定位为 `emit_condition()` 的无符号条件错误：
+
+- `COND_A` 原本实现为 `C && !Z`，正确语义是 `!C && !Z`；
+- `COND_BE` 原本实现为 `!(C && !Z)`，正确语义是 `C || Z`。
+
+在 SH-2 的 `write32` handle 中，地址 `0x60000000` 本应因大于 fastram 结束地址而跳过 workram 快速路径，但错误的 `COND_A` 使它落入快速路径，用 `fastbase + address` 访问未映射的宿主地址并崩溃。修正 `src/devices/cpu/drcbela64.cpp:713` 后，`diehard` 连续运行 30 秒正常退出。
+
 ### 9.4 后续工作
 
-- 继续用 POWERPC、SH、UNSP、ADSP、DSPP 等前端做回归，重点覆盖 BFXU/BFXS、ROLAND/ROLINS、ROLC/RORC、64 位 DIV/MUL、SAVE/RESTORE、异常路径和 `RECOVER`。
+- SH-2 已通过 `diehard` 实测；继续用 POWERPC、SH4、UNSP、ADSP、DSPP 等前端做回归，重点覆盖 BFXU/BFXS、ROLAND/ROLINS、ROLC/RORC、64 位 DIV/MUL、SAVE/RESTORE、异常路径和 `RECOVER`。
+- 为 `COND_A`/`COND_BE` 等条件码补充独立的标志位组合测试，避免只靠 MIPS3 用例覆盖。
 - 开发期建议用 `-DLA_DEBUG` 编译 `lagoon.c`，让立即数越界尽早断言。
 - 当前实现以正确性优先，未做 CMP+条件分支融合、常量折叠和分支岛等优化；后续可以在 `emit_skip`/`op_jmp` 与 CMP/TEST 上做 peephole。
 - 如需在同一个后端实例上递归 `execute()`，顶层 SP 目前保存在 near cache 中，建议后续改为保存到保留的 callee-saved 寄存器或显式保存栈，以避免递归覆盖。
