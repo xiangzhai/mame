@@ -31,7 +31,7 @@ class drc_condtest_state : public driver_device
 public:
 	drc_condtest_state(const machine_config &mconfig, device_type type, const char *tag)
 		: driver_device(mconfig, type, tag)
-		, m_cache(16 * 1024 * 1024)
+		, m_cache(64 * 1024 * 1024)
 	{
 	}
 
@@ -46,17 +46,25 @@ private:
 	static constexpr int COND_COUNT = uml::COND_MAX - uml::COND_Z;
 	static constexpr int FLAG_COUNT = 32;
 
+	static constexpr int MAX_FUSION_CASES = 2048;
+
 	static bool condition_true(uml::condition_t cond, u8 flags);
 	static char const *condition_name(uml::condition_t cond);
+	static u8 sub_flags(u64 a, u64 b, bool dsize);
+	static u8 and_flags(u64 value, bool dsize);
 	void check_results(char const *what, std::array<u32, COND_COUNT * FLAG_COUNT> const &results, int &errors);
 
 	drc_cache m_cache;
 	std::unique_ptr<drcuml_state> m_drcuml;
 	uml::code_handle *m_entry = nullptr;
 	int m_label = 0;
+	int m_fusion_count = 0;
 
 	std::array<u32, COND_COUNT * FLAG_COUNT> m_set_results{};
 	std::array<u32, COND_COUNT * FLAG_COUNT> m_jump_results{};
+	std::array<u32, MAX_FUSION_CASES> m_fusion_results{};
+	std::array<u32, MAX_FUSION_CASES> m_fusion_expected{};
+	std::array<u64, MAX_FUSION_CASES> m_fusion_operands{};
 };
 
 
@@ -89,6 +97,52 @@ bool drc_condtest_state::condition_true(uml::condition_t cond, u8 flags)
 	default:
 		return false;
 	}
+}
+
+
+u8 drc_condtest_state::sub_flags(u64 a, u64 b, bool dsize)
+{
+	u8 flags = 0;
+	if (!dsize)
+	{
+		u32 const aa = u32(a);
+		u32 const bb = u32(b);
+		u32 const rr = aa - bb;
+		if (bb > aa)
+			flags |= uml::FLAG_C;
+		if (u32((aa ^ bb) & (aa ^ rr)) >> 31)
+			flags |= uml::FLAG_V;
+		if (!rr)
+			flags |= uml::FLAG_Z;
+		if (rr >> 31)
+			flags |= uml::FLAG_S;
+	}
+	else
+	{
+		u64 const rr = a - b;
+		if (b > a)
+			flags |= uml::FLAG_C;
+		if (u64((a ^ b) & (a ^ rr)) >> 63)
+			flags |= uml::FLAG_V;
+		if (!rr)
+			flags |= uml::FLAG_Z;
+		if (rr >> 63)
+			flags |= uml::FLAG_S;
+	}
+	return flags;
+}
+
+
+u8 drc_condtest_state::and_flags(u64 value, bool dsize)
+{
+	if (!dsize)
+		value = u32(value);
+	u8 flags = 0;
+	if (!value)
+		flags |= uml::FLAG_Z;
+	if (value >> (dsize ? 63 : 31))
+		flags |= uml::FLAG_S;
+	return flags;
 }
 
 
@@ -157,7 +211,7 @@ void drc_condtest_state::machine_start()
 	m_drcuml = std::make_unique<drcuml_state>(*this, m_cache, flags, 8, 32, 2, 0x1000);
 	m_entry = m_drcuml->handle_alloc("entry");
 
-	drcuml_block &block = m_drcuml->begin_block(16384);
+	drcuml_block &block = m_drcuml->begin_block(65536);
 	UML_HANDLE(block, *m_entry);
 
 	int index = 0;
@@ -168,22 +222,133 @@ void drc_condtest_state::machine_start()
 		{
 			// direct condition evaluation (SETc)
 			UML_SETFLGS(block, f);
-			UML_SETc(block, cond, I0);
-			UML_STORE(block, &m_set_results[index], 0, I0, SIZE_DWORD, SCALE_x1);
+			UML_SETc(block, cond, uml::I0);
+			UML_STORE(block, &m_set_results[index], 0, uml::I0, SIZE_DWORD, SCALE_x1);
 
 			// conditional branch path (emit_skip)
 			uml::code_label const taken = m_label++;
 			uml::code_label const done = m_label++;
 			UML_SETFLGS(block, f);
 			UML_JMPc(block, cond, taken);
-			UML_MOV(block, I0, 0);
+			UML_MOV(block, uml::I0, 0);
 			UML_JMP(block, done);
 			UML_LABEL(block, taken);
-			UML_MOV(block, I0, 1);
+			UML_MOV(block, uml::I0, 1);
 			UML_LABEL(block, done);
-			UML_STORE(block, &m_jump_results[index], 0, I0, SIZE_DWORD, SCALE_x1);
+			UML_STORE(block, &m_jump_results[index], 0, uml::I0, SIZE_DWORD, SCALE_x1);
 
 			index++;
+		}
+	}
+
+	uml::condition_t const cmp_conditions[] =
+	{
+		uml::COND_Z, uml::COND_NZ, uml::COND_S, uml::COND_NS,
+		uml::COND_C, uml::COND_NC, uml::COND_V, uml::COND_NV,
+		uml::COND_A, uml::COND_BE, uml::COND_G, uml::COND_LE,
+		uml::COND_L, uml::COND_GE
+	};
+	uml::condition_t const test_conditions[] =
+	{
+		uml::COND_Z, uml::COND_NZ, uml::COND_S, uml::COND_NS
+	};
+	u64 const values[][2] =
+	{
+		{ 0, 0 },
+		{ 1, 2 },
+		{ 2, 1 },
+		{ 0x12345678, 0x12345678 },
+		{ 0xffffffff, 1 },
+		{ 0x80000000, 0x7fffffff },
+		{ 0xffffffffffffffffull, 1 },
+		{ 0x8000000000000000ull, 0x7fffffffffffffffull }
+	};
+
+	auto emit_fusion_case = [&](bool is_cmp, bool dsize, uml::condition_t cond, int form, u64 a, u64 b)
+	{
+		if (m_fusion_count >= MAX_FUSION_CASES)
+			throw emu_fatalerror("drc_condtest: too many fusion cases\n");
+
+		int const case_index = m_fusion_count++;
+		m_fusion_operands[case_index] = b;
+		if (dsize)
+		{
+			block.append().dmov(uml::I0, a);
+			block.append().dmov(uml::I1, b);
+		}
+		else
+		{
+			block.append().mov(uml::I0, u32(a));
+			block.append().mov(uml::I1, u32(b));
+		}
+
+		UML_SETFLGS(block, 0);
+
+		uml::parameter imm_a = a;
+		uml::parameter imm_b = b;
+		uml::parameter mem_b = uml::mem(&m_fusion_operands[case_index]);
+		if (is_cmp)
+		{
+			switch (form)
+			{
+			case 0: dsize ? block.append().dcmp(uml::I0, uml::I1) : block.append().cmp(uml::I0, uml::I1); break;
+			case 1: dsize ? block.append().dcmp(uml::I0, imm_b) : block.append().cmp(uml::I0, imm_b); break;
+			case 2: dsize ? block.append().dcmp(imm_a, uml::I1) : block.append().cmp(imm_a, uml::I1); break;
+			case 3: dsize ? block.append().dcmp(imm_a, imm_b) : block.append().cmp(imm_a, imm_b); break;
+			case 4: dsize ? block.append().dcmp(uml::I0, mem_b) : block.append().cmp(uml::I0, mem_b); break;
+			case 5: dsize ? block.append().dcmp(mem_b, imm_a) : block.append().cmp(mem_b, imm_a); break;
+			case 6: dsize ? block.append().dcmp(uml::I0, uml::I0) : block.append().cmp(uml::I0, uml::I0); break;
+			default: dsize ? block.append().dcmp(mem_b, mem_b) : block.append().cmp(mem_b, mem_b); break;
+			}
+		}
+		else
+		{
+			switch (form)
+			{
+			case 0: dsize ? block.append().dtest(uml::I0, uml::I1) : block.append().test(uml::I0, uml::I1); break;
+			case 1: dsize ? block.append().dtest(uml::I0, imm_b) : block.append().test(uml::I0, imm_b); break;
+			case 2: dsize ? block.append().dtest(imm_a, imm_b) : block.append().test(imm_a, imm_b); break;
+			default: dsize ? block.append().dtest(uml::I0, mem_b) : block.append().test(uml::I0, mem_b); break;
+			}
+		}
+
+		uml::code_label const taken = m_label++;
+		uml::code_label const done = m_label++;
+		UML_JMPc(block, cond, taken);
+		UML_MOV(block, uml::I2, 0);
+		UML_JMP(block, done);
+		UML_LABEL(block, taken);
+		UML_MOV(block, uml::I2, 1);
+		UML_LABEL(block, done);
+		UML_STORE(block, &m_fusion_results[case_index], 0, uml::I2, SIZE_DWORD, SCALE_x1);
+
+		u64 cmp_a = a;
+		u64 cmp_b = b;
+		if (is_cmp)
+		{
+			switch (form)
+			{
+			case 5: cmp_a = b; cmp_b = a; break;
+			case 6: cmp_b = a; break;
+			case 7: cmp_a = b; break;
+			default: break;
+			}
+		}
+		u8 const fused_flags = is_cmp ? sub_flags(cmp_a, cmp_b, dsize) : and_flags(a & b, dsize);
+		m_fusion_expected[case_index] = condition_true(cond, fused_flags) ? 1 : 0;
+	};
+
+	for (auto const &value : values)
+	{
+		for (bool const dsize : { false, true })
+		{
+			for (uml::condition_t const cond : cmp_conditions)
+				for (int form = 0; form < 8; form++)
+					emit_fusion_case(true, dsize, cond, form, value[0], value[1]);
+
+			for (uml::condition_t const cond : test_conditions)
+				for (int form = 0; form < 4; form++)
+					emit_fusion_case(false, dsize, cond, form, value[0], value[1]);
 		}
 	}
 
@@ -199,11 +364,22 @@ void drc_condtest_state::machine_start()
 	check_results("SETc", m_set_results, errors);
 	check_results("JMPc", m_jump_results, errors);
 
+	for (int fusion_index = 0; fusion_index < m_fusion_count; fusion_index++)
+	{
+		if (m_fusion_results[fusion_index] != m_fusion_expected[fusion_index])
+		{
+			if (errors < 32)
+				osd_printf_error("drc_condtest: CMP/TEST case %d: expected %u, got %u\n",
+						fusion_index, m_fusion_expected[fusion_index], m_fusion_results[fusion_index]);
+			errors++;
+		}
+	}
+
 	if (errors != 0)
 		throw emu_fatalerror("drc_condtest: %d condition/flag mismatch(es)\n", errors);
 
-	osd_printf_info("drc_condtest: PASS (%d conditions x %d flag combinations x 2 paths)\n",
-			COND_COUNT, FLAG_COUNT);
+	osd_printf_info("drc_condtest: PASS (%d conditions x %d flag combinations x 2 paths, %d CMP/TEST + branch cases)\n",
+			COND_COUNT, FLAG_COUNT, m_fusion_count);
 
 	machine().schedule_exit();
 }

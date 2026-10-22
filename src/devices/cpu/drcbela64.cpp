@@ -144,6 +144,144 @@ inline la_fpr_t select_register(la_fpr_t reg, uint32_t regsize)
 }
 
 
+//-------------------------------------------------
+//  condition helpers (shared by the flag tests and
+//  the CMP/TEST + branch peephole)
+//-------------------------------------------------
+
+inline bool evaluate_condition(uml::condition_t cond, uint8_t flags)
+{
+	bool const c = bool(flags & uml::FLAG_C);
+	bool const v = bool(flags & uml::FLAG_V);
+	bool const z = bool(flags & uml::FLAG_Z);
+	bool const s = bool(flags & uml::FLAG_S);
+	bool const u = bool(flags & uml::FLAG_U);
+
+	switch (cond)
+	{
+	case uml::COND_Z:  return z;
+	case uml::COND_NZ: return !z;
+	case uml::COND_S:  return s;
+	case uml::COND_NS: return !s;
+	case uml::COND_C:  return c;
+	case uml::COND_NC: return !c;
+	case uml::COND_V:  return v;
+	case uml::COND_NV: return !v;
+	case uml::COND_U:  return u;
+	case uml::COND_NU: return !u;
+	case uml::COND_A:  return !z && !c;
+	case uml::COND_BE: return z || c;
+	case uml::COND_G:  return !z && (s == v);
+	case uml::COND_LE: return z || (s != v);
+	case uml::COND_L:  return s != v;
+	case uml::COND_GE: return s == v;
+	default:           return true;
+	}
+}
+
+inline uml::condition_t invert_condition(uml::condition_t cond)
+{
+	switch (cond)
+	{
+	case uml::COND_Z:  return uml::COND_NZ;
+	case uml::COND_NZ: return uml::COND_Z;
+	case uml::COND_S:  return uml::COND_NS;
+	case uml::COND_NS: return uml::COND_S;
+	case uml::COND_C:  return uml::COND_NC;
+	case uml::COND_NC: return uml::COND_C;
+	case uml::COND_V:  return uml::COND_NV;
+	case uml::COND_NV: return uml::COND_V;
+	case uml::COND_U:  return uml::COND_NU;
+	case uml::COND_NU: return uml::COND_U;
+	case uml::COND_A:  return uml::COND_BE;
+	case uml::COND_BE: return uml::COND_A;
+	case uml::COND_G:  return uml::COND_LE;
+	case uml::COND_LE: return uml::COND_G;
+	case uml::COND_L:  return uml::COND_GE;
+	case uml::COND_GE: return uml::COND_L;
+	default:           return uml::COND_ALWAYS;
+	}
+}
+
+inline bool condition_is_compare(uml::condition_t cond)
+{
+	switch (cond)
+	{
+	case uml::COND_Z:
+	case uml::COND_NZ:
+	case uml::COND_S:
+	case uml::COND_NS:
+	case uml::COND_C:
+	case uml::COND_NC:
+	case uml::COND_A:
+	case uml::COND_BE:
+	case uml::COND_G:
+	case uml::COND_LE:
+	case uml::COND_L:
+	case uml::COND_GE:
+		return true;
+	default:
+		return false;
+	}
+}
+
+inline uint8_t compute_sub_flags(uint64_t a, uint64_t b, uint32_t size)
+{
+	uint8_t flags = 0;
+	if (size == 4)
+	{
+		uint32_t const aa = uint32_t(a);
+		uint32_t const bb = uint32_t(b);
+		uint32_t const rr = aa - bb;
+		if (bb > aa)
+			flags |= uml::FLAG_C;
+		if (uint32_t((aa ^ bb) & (aa ^ rr)) >> 31)
+			flags |= uml::FLAG_V;
+		if (!rr)
+			flags |= uml::FLAG_Z;
+		if (rr >> 31)
+			flags |= uml::FLAG_S;
+	}
+	else
+	{
+		uint64_t const rr = a - b;
+		if (b > a)
+			flags |= uml::FLAG_C;
+		if (uint64_t((a ^ b) & (a ^ rr)) >> 63)
+			flags |= uml::FLAG_V;
+		if (!rr)
+			flags |= uml::FLAG_Z;
+		if (rr >> 63)
+			flags |= uml::FLAG_S;
+	}
+	return flags;
+}
+
+inline uint8_t compute_nz_flags(uint64_t value, uint32_t size)
+{
+	if (size == 4)
+		value = uint32_t(value);
+
+	uint8_t flags = 0;
+	if (!value)
+		flags |= uml::FLAG_Z;
+	if (value >> ((size * 8) - 1))
+		flags |= uml::FLAG_S;
+	return flags;
+}
+
+inline uint32_t find_label_index(const uml::instruction *instlist, uint32_t numinst, uint32_t label)
+{
+	for (uint32_t index = 0; index < numinst; index++)
+	{
+		uml::instruction const &inst = instlist[index];
+		if (inst.opcode() == uml::OP_LABEL && inst.param(0).is_code_label() && (uint32_t(inst.param(0).label()) == label))
+			return index;
+	}
+	return numinst;
+}
+
+
 class drcbe_la64 : public drcbe_interface
 {
 public:
@@ -260,7 +398,14 @@ private:
 	void emit_float_str_mem(lagoon_assembler_t &a, la_fpr_t reg, const void *ptr, int size) const;
 
 	void emit_skip(lagoon_assembler_t &a, uml::condition_t cond, lagoon_label_t &skip);
+	void emit_flag_branch(lagoon_assembler_t &a, uml::condition_t cond, bool branch_on_true, lagoon_label_t &target);
 	void emit_condition(lagoon_assembler_t &a, uml::condition_t cond, la_gpr_t dst);
+
+	// CMP/TEST + conditional branch peephole
+	bool try_fuse_cmp_branch(lagoon_assembler_t &a, const uml::instruction *instlist, uint32_t numinst, uint32_t inum, uint32_t &consumed);
+	bool flags_dead_from(const uml::instruction *instlist, uint32_t numinst, uint32_t start, uint8_t flags, std::vector<bool> &visited) const;
+	bool emit_cmp_branch(lagoon_assembler_t &a, uml::condition_t cond, const be_parameter &src1p, const be_parameter &src2p, uint32_t size, lagoon_label_t &target);
+	bool emit_test_branch(lagoon_assembler_t &a, uml::condition_t cond, const be_parameter &src1p, const be_parameter &src2p, uint32_t size, lagoon_label_t &target);
 
 	void emit_memaccess_setup(lagoon_assembler_t &a, const be_parameter &addrp, const memory_accessors &accessors, const address_space::specific_access_info::side &side) const;
 	void emit_specific_call(lagoon_assembler_t &a, const address_space::specific_access_info::side &side) const;
@@ -768,13 +913,76 @@ void drcbe_la64::emit_condition(lagoon_assembler_t &a, uml::condition_t cond, la
 	}
 }
 
-void drcbe_la64::emit_skip(lagoon_assembler_t &a, uml::condition_t cond, lagoon_label_t &skip)
+void drcbe_la64::emit_flag_branch(lagoon_assembler_t &a, uml::condition_t cond, bool branch_on_true, lagoon_label_t &target)
 {
 	if (cond == uml::COND_ALWAYS)
+	{
+		if (branch_on_true)
+			la_b(&a, la_label(&a, &target));
 		return;
+	}
 
-	emit_condition(a, cond, SCRATCH_REG1);
-	la_beqz(&a, SCRATCH_REG1, la_label(&a, &skip));
+	auto branch_if_nonzero = [&a, &target](bool nonzero)
+	{
+		if (nonzero)
+			la_bnez(&a, SCRATCH_REG1, la_label(&a, &target));
+		else
+			la_beqz(&a, SCRATCH_REG1, la_label(&a, &target));
+	};
+
+	switch (cond)
+	{
+	case uml::COND_Z:  la_andi(&a, SCRATCH_REG1, FLAGS_REG, uml::FLAG_Z); branch_if_nonzero(branch_on_true);  break;
+	case uml::COND_NZ: la_andi(&a, SCRATCH_REG1, FLAGS_REG, uml::FLAG_Z); branch_if_nonzero(!branch_on_true); break;
+
+	case uml::COND_S:  la_andi(&a, SCRATCH_REG1, FLAGS_REG, uml::FLAG_S); branch_if_nonzero(branch_on_true);  break;
+	case uml::COND_NS: la_andi(&a, SCRATCH_REG1, FLAGS_REG, uml::FLAG_S); branch_if_nonzero(!branch_on_true); break;
+
+	case uml::COND_C:  la_andi(&a, SCRATCH_REG1, FLAGS_REG, uml::FLAG_C); branch_if_nonzero(branch_on_true);  break;
+	case uml::COND_NC: la_andi(&a, SCRATCH_REG1, FLAGS_REG, uml::FLAG_C); branch_if_nonzero(!branch_on_true); break;
+
+	case uml::COND_V:  la_andi(&a, SCRATCH_REG1, FLAGS_REG, uml::FLAG_V); branch_if_nonzero(branch_on_true);  break;
+	case uml::COND_NV: la_andi(&a, SCRATCH_REG1, FLAGS_REG, uml::FLAG_V); branch_if_nonzero(!branch_on_true); break;
+
+	case uml::COND_U:  la_andi(&a, SCRATCH_REG1, FLAGS_REG, uml::FLAG_U); branch_if_nonzero(branch_on_true);  break;
+	case uml::COND_NU: la_andi(&a, SCRATCH_REG1, FLAGS_REG, uml::FLAG_U); branch_if_nonzero(!branch_on_true); break;
+
+	case uml::COND_A:
+		la_andi(&a, SCRATCH_REG1, FLAGS_REG, uml::FLAG_C | uml::FLAG_Z);
+		branch_if_nonzero(!branch_on_true);
+		break;
+	case uml::COND_BE:
+		la_andi(&a, SCRATCH_REG1, FLAGS_REG, uml::FLAG_C | uml::FLAG_Z);
+		branch_if_nonzero(branch_on_true);
+		break;
+
+	case uml::COND_L:
+	case uml::COND_GE:
+		// move V to the S position, then xor: bit 3 becomes S^V
+		la_slli_d(&a, SCRATCH_REG1, FLAGS_REG, uml::FLAG_BIT_S - uml::FLAG_BIT_V);
+		la_xor(&a, SCRATCH_REG1, SCRATCH_REG1, FLAGS_REG);
+		la_andi(&a, SCRATCH_REG1, SCRATCH_REG1, uml::FLAG_S);
+		branch_if_nonzero(cond == uml::COND_L ? branch_on_true : !branch_on_true);
+		break;
+
+	case uml::COND_G:
+	case uml::COND_LE:
+		// extract S:Z:V, then reduce it to (S^V) | Z without pollution
+		la_bstrpick_d(&a, SCRATCH_REG1, FLAGS_REG, uml::FLAG_BIT_S, uml::FLAG_BIT_V);
+		la_srli_d(&a, SCRATCH_REG2, SCRATCH_REG1, uml::FLAG_BIT_S - uml::FLAG_BIT_V);
+		la_xor(&a, SCRATCH_REG1, SCRATCH_REG2, SCRATCH_REG1);
+		la_andi(&a, SCRATCH_REG1, SCRATCH_REG1, 3);
+		branch_if_nonzero(cond == uml::COND_LE ? branch_on_true : !branch_on_true);
+		break;
+
+	default:
+		throw emu_fatalerror("drcbe_la64: invalid condition %u\n", unsigned(cond));
+	}
+}
+
+void drcbe_la64::emit_skip(lagoon_assembler_t &a, uml::condition_t cond, lagoon_label_t &skip)
+{
+	emit_flag_branch(a, cond, false, skip);
 }
 
 void drcbe_la64::emit_flags_nz(lagoon_assembler_t &a, la_gpr_t reg, int bits, la_gpr_t output)
@@ -1389,6 +1597,7 @@ void drcbe_la64::generate(drcuml_block &block, const instruction *instlist, uint
 
 	for (uint32_t inum = 0; inum < numinst; inum++)
 	{
+		uint32_t const instnum = inum;
 		const instruction &inst = instlist[inum];
 
 		if (la_get_remaining_buffer_size(&a) < MAX_OP_BYTES)
@@ -1403,11 +1612,24 @@ void drcbe_la64::generate(drcuml_block &block, const instruction *instlist, uint
 		}
 
 		uint8_t *before = a.cursor;
-		generate_one(a, inst);
+		uint32_t consumed = 1;
+		if (!try_fuse_cmp_branch(a, instlist, numinst, inum, consumed))
+			generate_one(a, inst);
+		inum += consumed - 1;
 
 		if (m_log_native && (a.cursor != before))
 		{
 			std::string dasm = inst.disasm(&m_drcuml);
+			if (consumed > 1)
+			{
+				dasm += " ; fused with ";
+				for (uint32_t index = 1; index < consumed; index++)
+				{
+					if (index > 1)
+						dasm += ", ";
+					dasm += instlist[instnum + index].disasm(&m_drcuml);
+				}
+			}
 			log_entries.emplace_back(before, a.cursor, std::move(dasm));
 		}
 	}
@@ -1754,12 +1976,284 @@ void drcbe_la64::op_jmp(lagoon_assembler_t &a, const uml::instruction &inst)
 		return;
 	}
 
+	// branch island: keep the short-range conditional branch local and use
+	// the 26-bit unconditional branch to reach the real target
 	lagoon_label_t skip = {};
 	emit_skip(a, inst.condition(), skip);
 	la_b(&a, la_label(&a, &target));
 	la_bind(&a, &skip);
 	la_label_free(&a, &skip);
 }
+
+bool drcbe_la64::flags_dead_from(const uml::instruction *instlist, uint32_t numinst, uint32_t start, uint8_t flags, std::vector<bool> &visited) const
+{
+	uint32_t pc = start;
+	while (pc < numinst)
+	{
+		if (visited[pc])
+			return true;
+		visited[pc] = true;
+
+		uml::instruction const &inst = instlist[pc];
+		switch (inst.opcode())
+		{
+		case uml::OP_HANDLE:
+			// a new entry point; flags are not part of the block entry state
+			return true;
+
+		case uml::OP_LABEL:
+		case uml::OP_COMMENT:
+		case uml::OP_MAPVAR:
+		case uml::OP_HASH:
+		case uml::OP_NOP:
+			pc++;
+			continue;
+
+		default:
+			break;
+		}
+
+		// if anything reads the flags before they can be overwritten, they are live
+		if (inst.input_flags() & flags)
+			return false;
+
+		// unconditional instructions that write flags kill the old values
+		if (inst.condition() == uml::COND_ALWAYS && (inst.modified_flags() & flags))
+			return true;
+
+		// follow intra-block jumps; flags are part of the path
+		if (inst.opcode() == uml::OP_JMP)
+		{
+			uint32_t const target = find_label_index(instlist, numinst, inst.param(0).label());
+			if (target >= numinst)
+				return false;
+			if (!flags_dead_from(instlist, numinst, target, flags, visited))
+				return false;
+			if (inst.condition() == uml::COND_ALWAYS)
+				return true;
+			pc++;
+			continue;
+		}
+
+		switch (inst.opcode())
+		{
+		case uml::OP_EXIT:
+		case uml::OP_HASHJMP:
+		case uml::OP_RET:
+			// control leaves the block; the software flags are block-local
+			return true;
+
+		case uml::OP_EXH:
+		case uml::OP_CALLH:
+			// callee may consume the flags; keep the computation
+			return false;
+
+		default:
+			break;
+		}
+
+		pc++;
+	}
+	return true;
+}
+
+
+bool drcbe_la64::emit_cmp_branch(lagoon_assembler_t &a, uml::condition_t cond, const be_parameter &src1p, const be_parameter &src2p, uint32_t size, lagoon_label_t &target)
+{
+	if (!condition_is_compare(cond))
+		return false;
+
+	mov_reg_param(a, size, TEMP_REG1, src1p);
+	mov_reg_param(a, size, TEMP_REG2, src2p);
+
+	switch (cond)
+	{
+	case uml::COND_Z:  la_beq(&a, TEMP_REG1, TEMP_REG2, la_label(&a, &target)); break;
+	case uml::COND_NZ: la_bne(&a, TEMP_REG1, TEMP_REG2, la_label(&a, &target)); break;
+
+	// carry is an unsigned borrow: src1 < src2
+	case uml::COND_C:  la_bltu(&a, TEMP_REG1, TEMP_REG2, la_label(&a, &target)); break;
+	case uml::COND_NC: la_bgeu(&a, TEMP_REG1, TEMP_REG2, la_label(&a, &target)); break;
+
+	// above/below-or-equal are unsigned compares
+	case uml::COND_A:  la_bltu(&a, TEMP_REG2, TEMP_REG1, la_label(&a, &target)); break;
+	case uml::COND_BE: la_bgeu(&a, TEMP_REG2, TEMP_REG1, la_label(&a, &target)); break;
+
+	case uml::COND_L:
+	case uml::COND_GE:
+	case uml::COND_G:
+	case uml::COND_LE:
+		if (size == 4)
+		{
+			sign_extend32(a, TEMP_REG1);
+			sign_extend32(a, TEMP_REG2);
+		}
+		if (cond == uml::COND_L)
+			la_blt(&a, TEMP_REG1, TEMP_REG2, la_label(&a, &target));
+		else if (cond == uml::COND_GE)
+			la_bge(&a, TEMP_REG1, TEMP_REG2, la_label(&a, &target));
+		else if (cond == uml::COND_G)
+			la_blt(&a, TEMP_REG2, TEMP_REG1, la_label(&a, &target));
+		else
+			la_bge(&a, TEMP_REG2, TEMP_REG1, la_label(&a, &target));
+		break;
+
+	case uml::COND_S:
+	case uml::COND_NS:
+		la_sub_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+		la_bstrpick_d(&a, TEMP_REG3, TEMP_REG3, (size * 8) - 1, (size * 8) - 1);
+		if (cond == uml::COND_S)
+			la_bnez(&a, TEMP_REG3, la_label(&a, &target));
+		else
+			la_beqz(&a, TEMP_REG3, la_label(&a, &target));
+		break;
+
+	default:
+		return false;
+	}
+	return true;
+}
+
+
+bool drcbe_la64::emit_test_branch(lagoon_assembler_t &a, uml::condition_t cond, const be_parameter &src1p, const be_parameter &src2p, uint32_t size, lagoon_label_t &target)
+{
+	switch (cond)
+	{
+	case uml::COND_Z:
+	case uml::COND_NZ:
+	case uml::COND_S:
+	case uml::COND_NS:
+		break;
+	default:
+		return false;
+	}
+
+	mov_reg_param(a, size, TEMP_REG1, src1p);
+	mov_reg_param(a, size, TEMP_REG2, src2p);
+	la_and(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+
+	switch (cond)
+	{
+	case uml::COND_Z:  la_beqz(&a, TEMP_REG3, la_label(&a, &target)); break;
+	case uml::COND_NZ: la_bnez(&a, TEMP_REG3, la_label(&a, &target)); break;
+	case uml::COND_S:
+		la_bstrpick_d(&a, TEMP_REG3, TEMP_REG3, (size * 8) - 1, (size * 8) - 1);
+		la_bnez(&a, TEMP_REG3, la_label(&a, &target));
+		break;
+	case uml::COND_NS:
+		la_bstrpick_d(&a, TEMP_REG3, TEMP_REG3, (size * 8) - 1, (size * 8) - 1);
+		la_beqz(&a, TEMP_REG3, la_label(&a, &target));
+		break;
+	default:
+		return false;
+	}
+	return true;
+}
+
+
+bool drcbe_la64::try_fuse_cmp_branch(lagoon_assembler_t &a, const uml::instruction *instlist, uint32_t numinst, uint32_t inum, uint32_t &consumed)
+{
+	uml::instruction const &inst = instlist[inum];
+	bool const is_cmp = (inst.opcode() == uml::OP_CMP);
+	if ((!is_cmp && (inst.opcode() != uml::OP_TEST)) || (inst.condition() != uml::COND_ALWAYS))
+		return false;
+
+	uint8_t const cmpflags = inst.flags();
+	if (!cmpflags || ((inum + 1) >= numinst))
+		return false;
+
+	uml::instruction const &jmp = instlist[inum + 1];
+	if ((jmp.opcode() != uml::OP_JMP) || (jmp.condition() == uml::COND_ALWAYS) || (jmp.numparams() != 1) || !jmp.param(0).is_code_label())
+		return false;
+
+	uint8_t const produced = is_cmp ? (uml::FLAG_C | uml::FLAG_V | uml::FLAG_Z | uml::FLAG_S) : (uml::FLAG_Z | uml::FLAG_S);
+	uint8_t const used = jmp.input_flags();
+	if ((used & ~produced) != 0)
+		return false;
+	if ((used & ~cmpflags) != 0)
+		return false;
+
+	// the flag computation can only be dropped if the branch is the last reader
+	uint32_t const targetindex = find_label_index(instlist, numinst, jmp.param(0).label());
+	if (targetindex >= numinst)
+		return false;
+
+	std::vector<bool> visited(numinst, false);
+	if (!flags_dead_from(instlist, numinst, inum + 2, cmpflags, visited))
+		return false;
+	visited.assign(numinst, false);
+	if (!flags_dead_from(instlist, numinst, targetindex, cmpflags, visited))
+		return false;
+
+	be_parameter src1p(*this, inst.param(0), PTYPE_MRI);
+	be_parameter src2p(*this, inst.param(1), PTYPE_MRI);
+	lagoon_label_t &target = m_labels[jmp.param(0).label()];
+
+	// constant folding: both operands known, or CMP against itself
+	uint8_t folded = 0;
+	bool have_folded = false;
+	if (is_cmp)
+	{
+		if (src1p.is_immediate() && src2p.is_immediate())
+		{
+			folded = compute_sub_flags(src1p.immediate(), src2p.immediate(), inst.size());
+			have_folded = true;
+		}
+		else if (src1p == src2p)
+		{
+			folded = uml::FLAG_Z;
+			have_folded = true;
+		}
+	}
+	else
+	{
+		if (src1p.is_immediate() && src2p.is_immediate())
+		{
+			folded = compute_nz_flags(src1p.immediate() & src2p.immediate(), inst.size());
+			have_folded = true;
+		}
+		else if (src1p.is_immediate_value(0) || src2p.is_immediate_value(0))
+		{
+			folded = uml::FLAG_Z;
+			have_folded = true;
+		}
+	}
+
+	if (have_folded)
+	{
+		if (evaluate_condition(jmp.condition(), folded))
+			la_b(&a, la_label(&a, &target));
+		consumed = 2;
+		return true;
+	}
+
+	// use an island: the short conditional branch jumps over the long
+	// unconditional branch, keeping the target reach unrestricted
+	uml::condition_t const inverse = invert_condition(jmp.condition());
+	if (inverse == uml::COND_ALWAYS)
+		return false;
+	if (!condition_is_compare(inverse))
+		return false;
+	if (!is_cmp && (inverse != uml::COND_Z) && (inverse != uml::COND_NZ) && (inverse != uml::COND_S) && (inverse != uml::COND_NS))
+		return false;
+
+	lagoon_label_t over = {};
+	bool const emitted = is_cmp
+			? emit_cmp_branch(a, inverse, src1p, src2p, inst.size(), over)
+			: emit_test_branch(a, inverse, src1p, src2p, inst.size(), over);
+	if (!emitted)
+	{
+		la_label_free(&a, &over);
+		return false;
+	}
+	la_b(&a, la_label(&a, &target));
+	la_bind(&a, &over);
+	la_label_free(&a, &over);
+
+	consumed = 2;
+	return true;
+}
+
 
 void drcbe_la64::op_exh(lagoon_assembler_t &a, const uml::instruction &inst)
 {
@@ -2641,6 +3135,21 @@ void drcbe_la64::op_cmp(lagoon_assembler_t &a, const uml::instruction &inst)
 	be_parameter src2p(*this, inst.param(1), PTYPE_MRI);
 	const int bits = inst.size() * 8;
 
+	// nothing to do if the flags are dead
+	if (!inst.flags())
+		return;
+
+	// constant folding
+	if ((src1p.is_immediate() && src2p.is_immediate()) || (src1p == src2p))
+	{
+		uint8_t const value = src1p.is_immediate() && src2p.is_immediate()
+				? compute_sub_flags(src1p.immediate(), src2p.immediate(), inst.size())
+				: uint8_t(FLAG_Z);
+		load_imm32(a, FLAG_TMP_REG, value);
+		merge_flags(a, FLAG_C | FLAG_V | FLAG_Z | FLAG_S);
+		return;
+	}
+
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
 	mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
 
@@ -2654,11 +3163,8 @@ void drcbe_la64::op_cmp(lagoon_assembler_t &a, const uml::instruction &inst)
 		la_sub_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
 	}
 
-	if (inst.flags())
-	{
-		emit_flags_sub(a, TEMP_REG3, TEMP_REG1, TEMP_REG2, bits, false);
-		merge_flags(a, FLAG_C | FLAG_V | FLAG_Z | FLAG_S);
-	}
+	emit_flags_sub(a, TEMP_REG3, TEMP_REG1, TEMP_REG2, bits, false);
+	merge_flags(a, FLAG_C | FLAG_V | FLAG_Z | FLAG_S);
 }
 
 void drcbe_la64::op_and(lagoon_assembler_t &a, const uml::instruction &inst)
@@ -2698,6 +3204,17 @@ void drcbe_la64::op_test(lagoon_assembler_t &a, const uml::instruction &inst)
 
 	if (!inst.flags())
 		return;
+
+	// constant folding
+	if ((src1p.is_immediate() && src2p.is_immediate()) || src1p.is_immediate_value(0) || src2p.is_immediate_value(0))
+	{
+		uint8_t const value = compute_nz_flags(
+				(src1p.is_immediate() && src2p.is_immediate()) ? (src1p.immediate() & src2p.immediate()) : 0,
+				inst.size());
+		load_imm32(a, FLAG_TMP_REG, value);
+		merge_flags(a, FLAG_Z | FLAG_S);
+		return;
+	}
 
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
 	mov_reg_param(a, inst.size(), TEMP_REG2, src2p);

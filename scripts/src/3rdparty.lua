@@ -1988,18 +1988,34 @@ project "residfp"
 --------------------------------------------------
 
 if (not _OPTIONS["FORCE_DRC_C_BACKEND"]) and (_OPTIONS["PLATFORM"] == "loongarch64") then
+-- Debug builds and standalone DRC test drivers keep the range assertions.
+local lagoon_debug = string.match(_OPTIONS["subtarget"] or "", "^drc_.*test$")
+
 project "lagoon"
 	uuid "4a0d6c9d-7f5a-4f42-9a4e-51e0f6d3c2b1"
 	kind "StaticLib"
 
-	defines {
-		"LA_DEBUG",
-	}
+	-- keep the assertion-enabled test library separate from the release one
+	if lagoon_debug then
+		targetdir(MAME_DIR .. "scripts/lagoon_test")
+	end
 
-	configuration { "gmake or ninja or jcdb" }
-		buildoptions {
-			"-UNDEBUG",
+	configuration { "Debug" }
+		defines {
+			"LA_DEBUG",
 		}
+
+	if lagoon_debug then
+		configuration { "Release" }
+			defines {
+				"LA_DEBUG",
+			}
+
+		configuration { "Release", "gmake or ninja or jcdb" }
+			buildoptions {
+				"-UNDEBUG",
+			}
+	end
 
 	configuration { }
 

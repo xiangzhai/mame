@@ -82,7 +82,7 @@ bit0 = C, bit1 = V, bit2 = Z, bit3 = S, bit4 = U   // 与 uml::FLAG_BIT_* 一致
   `t = a + b; c1 = t < a; u = t + cin; c2 = u < t; carry = c1 | c2`
 - `ROLC/RORC`、移位产生的 carry：LoongArch 没有 ARM 的 `S` 后缀，只能显式算
 
-优化点：LoongArch 的条件分支直接比较两个寄存器（`beq/bne/blt/bge/bltu/bgeu`），可以在 `CMP/TEST` 后做 peephole，直接把条件分支翻成比较分支，省掉 flags 的读写。第一版先老老实实写 flags，正确性优先。
+优化点：LoongArch 的条件分支直接比较两个寄存器（`beq/bne/blt/bge/bltu/bgeu`），可以在 `CMP/TEST` 后做 peephole，直接把条件分支翻成比较分支，省掉 flags 的读写。该优化已经实现：`emit_skip` 直接测试标志位，`CMP/TEST + JMPc` 融合成寄存器/立即数比较分支，两个操作数都是常量时在编译期消解分支；跳向远端 label 时使用“短条件分支跳过一条长跳转”的分支岛。
 
 ### 3.3 32 位语义陷阱
 
@@ -101,7 +101,7 @@ bstrpick.d rd, rd, 31, 0     // 取低 32 位并零扩展
 - 近地址（near cache、`m_state`）：`la_la_local()` 生成 `pcalau12i` + `addi.d`，范围 ±2 GiB；`m_baseptr` 和 near cache 在同一块虚拟分配里
 - 从 near cache 加载指针（helper 的 `{obj, func}`）：`la_la_global()` 生成 `pcalau12i` + `ld.d`
 - **分支范围**：`b/bl` 是 26 位偏移（±128 MiB），`beq` 等条件分支是 16 位偏移（**只有 ±128 KiB**）。UML 的 `JMP` 只跳当前 block 内的 label（`uml_instructions.rst:327`），正常 block 不会超范围；但 `EXIT/HASHJMP/CALLH/HANDLE` 这类跳到 block 外的目标，一律用“`la_load_immediate64` 装入目标地址 + `la_jirl(LA_ZERO, reg, 0)`”的间接跳转
-- lagoon 的 `la_bind()` 回填分支偏移时**不做范围检查**（立即数越界只在 `LA_DEBUG` 下断言，本仓库已开启），所以更不能拿 16 位条件分支去跳远端
+- lagoon 的 `la_bind()` 回填分支偏移时**不做范围检查**（立即数越界只在 `LA_DEBUG` 下断言；Debug 和 `drc_*test` 测试构建会开启，Release `mame` 不开启），所以更不能拿 16 位条件分支去跳远端
 
 ### 3.5 内存访问
 
@@ -175,7 +175,7 @@ exit:
 ### 4.1 lagoon 的边界和坑
 
 1. **没有缓冲区越界检查**：`emit32` 直接写 `cursor`，只有 `la_get_remaining_buffer_size()` 可用。MAME 必须在每次生成后检查剩余空间，不足时安全地 `end_codegen()` 再 `block.abort()`。
-2. **立即数范围只在 `LA_DEBUG` 下断言**：`scripts/src/3rdparty.lua` 的 `lagoon` project 已默认定义 `LA_DEBUG`，并在 gmake/ninja/jcdb 构建中追加 `-UNDEBUG`，因此 Release 构建（默认带 `-DNDEBUG`）也会检查立即数范围。若在构建系统之外手工编译 `lagoon.c`，需要同时传 `-DLA_DEBUG -UNDEBUG`，否则 `assert()` 会被 `NDEBUG` 关闭；正规构建仍建议对关键立即数自己做范围检查。
+2. **立即数范围只在 `LA_DEBUG` 下断言**：`scripts/src/3rdparty.lua` 的 `lagoon` project 只在 Debug 构建和 `drc_*test` 测试驱动中定义 `LA_DEBUG`。测试驱动的 Release 构建会额外追加 `-UNDEBUG`，保证 `assert()` 不会被 `-DNDEBUG` 关闭，并把测试用的 `liblagoon.a` 输出到独立的 `scripts/lagoon_test/`，避免覆盖 Release `mame` 使用的 `scripts/src/liblagoon.a`；Release `mame` 主程序既不定义 `LA_DEBUG`，也不追加 `-UNDEBUG`，因此正式版不包含这些断言。若在构建系统之外手工编译 `lagoon.c`，需要同时传 `-DLA_DEBUG -UNDEBUG` 才能启用范围检查；正规构建仍建议对关键立即数自己做范围检查。
 3. **分支回填不检查范围**：`la_bind()` 对 16 位条件分支/26 位 `b/bl` 的偏移直接截断。UML 的 `JMP` 只在本 block 内（`uml_instructions.rst:327`），正常块大小没问题；但不要用 16 位条件分支跳远端。
 4. **`la_la_local()` / `la_la_global()` 是汇编时的 PC 相对寻址**：`offset` 相对当前 `cursor`，且 `la_bind()` 回填时按 `assembler->buffer` 计算页偏移。所以必须把代码**直接生成到最终地址**（MAME 的 `drc_cache::begin_codegen()`），不要先在临时 buffer 里汇编再 memcpy 到 cache，否则页内偏移可能错。如果一定要用临时 buffer，就只用普通分支标签，远端地址用 `la_load_immediate64()`。
 5. `la_bind()` 靠解码指令位模式识别 `b/bl/beq/bne/.../jirl` 和 `la.local/la.global` 的 `pcalau12i` 序列；`la_label()` 的返回值必须直接喂给这些指令，否则不会被回填。
@@ -349,7 +349,7 @@ endif
 
 ## 6. 实施顺序
 
-1. **集成 lagoon**：把 `lagoon.c`/`lagoon.h` 放进 `3rdparty/lagoon`，先跑通 `la_init_assembler()`、`la_label()/la_bind()`、`la_disasm_one()`，并写一个薄封装处理 buffer 剩余空间、label 生命周期和 `begin_codegen()`/`end_codegen()`；`LA_DEBUG` 已在 lagoon project 中默认开启，用于立即数范围检查。
+1. **集成 lagoon**：把 `lagoon.c`/`lagoon.h` 放进 `3rdparty/lagoon`，先跑通 `la_init_assembler()`、`la_label()/la_bind()`、`la_disasm_one()`，并写一个薄封装处理 buffer 剩余空间、label 生命周期和 `begin_codegen()`/`end_codegen()`；`LA_DEBUG` 只在 Debug 和 `drc_*test` 测试构建中开启，用于立即数范围检查。
 2. **骨架**：`reset/execute/generate/get_info/hash_*`，`generate` 先只处理 `NOP/EXIT/HANDLE/HASH/LABEL/COMMENT`，跑通 entry/exit 和 ABI。
 3. **控制流**：`JMP/HASHJMP/CALLH/RET/EXH`、handle fixup、`m_exit/m_nocode/m_endofblock`。
 4. **整数和 flags**：MOV/SET/ADD/ADDC/SUB/SUBB/CMP/TEST/AND/OR/XOR/移位/MUL/DIV/SEXT/BFXU/LZCNT/TZCNT/BSWAP/ROL/ROLC/RORC。
@@ -365,7 +365,7 @@ endif
 - `-drc_use_c`：强制 C 后端，和你的后端 A/B 对跑
 - `-nodrc`：解释器，作为最终 golden reference
 - 用同一存档/回放对比帧、音频、状态
-- `lagoon.c` 已默认启用 `LA_DEBUG`（并加 `-UNDEBUG`），立即数越界会直接断言
+- `lagoon.c` 在 Debug 和 `drc_*test` 测试构建中启用 `LA_DEBUG`（测试的 Release 构建另加 `-UNDEBUG`），立即数越界会直接断言；Release `mame` 不带 `LA_DEBUG`
 - 建议先让 `drcbe_la64` 对未实现 opcode 调 `block.abort()`，这样只影响测试用例，不会静默算错
 
 ## 8. 工作量估算
@@ -586,8 +586,9 @@ make -j"$(nproc)" SUBTARGET=drc_condtest SOURCES=src/mame/test/drc_condtest.cpp
 
 结果：
 
-- 原生后端和 `-drc_use_c` 都输出 `drc_condtest: PASS (16 conditions x 32 flag combinations x 2 paths)`。
+- 原生后端和 `-drc_use_c` 都输出 `drc_condtest: PASS (16 conditions x 32 flag combinations x 2 paths, 2048 CMP/TEST + branch cases)`。
 - 临时把 `COND_A`/`COND_BE` 改回修复前的实现重新构建，测试立即报告 64 个不匹配（`COND_A` 和 `COND_BE` 各 16 种标志组合 × 2 条路径），说明该测试确实能捕获这次回归。
+- 同一个测试现在还覆盖 `CMP/TEST + JMPc` 融合：8 组操作数 × 32/64 位 × 寄存器/立即数/内存/自比较等操作数形式 × 全部适用条件，共 2048 个检查；原生后端必须与 `-drc_use_c` 的结果一致。
 
 测试驱动通过 `src/mame/mame.lst` 注册为 `drc_condtest`，并在 `scripts/src/cpu.lua` 中为这个 subtarget 显式启用 DRC 核心；测试本身不实例化 MIPS3 或其他 guest CPU。
 
@@ -627,7 +628,7 @@ make -j"$(nproc)" SUBTARGET=drc_condtest SOURCES=src/mame/test/drc_condtest.cpp
 
 #### 9.4.7 `LA_DEBUG` 立即数断言与符号扩展修正
 
-`scripts/src/3rdparty.lua` 的 `lagoon` project 现在固定定义 `LA_DEBUG`，并在 gmake/ninja/jcdb 构建中追加 `-UNDEBUG`，确保 Release 配置（默认带 `-DNDEBUG`）下 lagoon 的立即数范围断言仍然有效。
+`scripts/src/3rdparty.lua` 的 `lagoon` project 在 Debug 构建和 `drc_*test` 测试驱动中定义 `LA_DEBUG`，并为测试的 Release 构建追加 `-UNDEBUG`，确保测试目标（默认带 `-DNDEBUG`）下 lagoon 的立即数范围断言仍然有效；Release `mame` 主程序不定义 `LA_DEBUG`，正式版不包含断言。
 
 启用断言后，`drc_condtest` 和 `drc_specifictest` 曾在启动阶段（`drcbe_la64` 构造）立即触发：
 
@@ -640,13 +641,13 @@ make -j"$(nproc)" SUBTARGET=drc_condtest SOURCES=src/mame/test/drc_condtest.cpp
 现在 `lagoon.c` 增加 `la_sign_extend()`，在装载 20 位 `lu12i.w`/`lu32i.d` 字段和 12 位 `lu52i.d`/`addi.w` 字段时先做符号扩展，再传给 lagoon 的编码函数。修正后两个测试在原生和 `-drc_use_c` 后端均通过：
 
 ```
-drc_condtest: PASS (16 conditions x 32 flag combinations x 2 paths)
+drc_condtest: PASS (16 conditions x 32 flag combinations x 2 paths, 2048 CMP/TEST + branch cases)
 drc_specifictest: PASS (8 dword reads + 8 dword writes + mask-sensitive register, 32-bit native space)
 ```
 
 ### 9.5 后续工作
 
 - POWERPC、UNSP、ADSP(SHARC)、DSPP 的真实 ROM 回归尚未完成；拿到合法 ROM/可构建的开源测试程序后，继续按 9.4.1 的用例清单做 native vs `-drc_use_c` A/B。
-- `lagoon.c` 已默认用 `-DLA_DEBUG` 编译（Release 下通过 `-UNDEBUG` 保持断言）；`la_load_immediate32/64()` 的 20/12 位立即数已按 9.4.7 完成符号扩展修正。
-- 当前实现以正确性优先，未做 CMP+条件分支融合、常量折叠和分支岛等优化；后续可以在 `emit_skip`/`op_jmp` 与 CMP/TEST 上做 peephole。
+- `lagoon.c` 只在 Debug 和 `drc_*test` 测试构建中用 `-DLA_DEBUG` 编译（测试的 Release 构建通过 `-UNDEBUG` 保持断言，Release `mame` 不带 `LA_DEBUG`）；`la_load_immediate32/64()` 的 20/12 位立即数已按 9.4.7 完成符号扩展修正。
+- 已实现 `emit_skip` 标志位直接分支、`CMP/TEST + JMPc` 融合、CMP/TEST 常量折叠和远端条件分支的分支岛；标志位活性检查目前跟随 UML 优化器的线性模型，后续可扩展为更精确的 CFG 数据流分析。
 - 如需在同一个后端实例上递归 `execute()`，顶层 SP 目前保存在 near cache 中，建议后续改为保存到保留的 callee-saved 寄存器或显式保存栈，以避免递归覆盖。
