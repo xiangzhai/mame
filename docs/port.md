@@ -589,7 +589,7 @@ make -j"$(nproc)" SUBTARGET=drc_condtest SOURCES=src/mame/test/drc_condtest.cpp
 
 - 原生后端和 `-drc_use_c` 都输出 `drc_condtest: PASS (16 conditions x 32 flag combinations x 2 paths, 2048 CMP/TEST + branch cases)`。
 - 临时把 `COND_A`/`COND_BE` 改回修复前的实现重新构建，测试立即报告 64 个不匹配（`COND_A` 和 `COND_BE` 各 16 种标志组合 × 2 条路径），说明该测试确实能捕获这次回归。
-- 同一个测试现在还覆盖 `CMP/TEST + JMPc` 融合：8 组操作数 × 32/64 位 × 寄存器/立即数/内存/自比较等操作数形式 × 全部适用条件，共 2048 个检查；原生后端必须与 `-drc_use_c` 的结果一致。
+- 同一个测试现在还覆盖 `CMP/TEST + JMPc` 融合：8 组操作数 × 32/64 位 × 寄存器/立即数/内存/自比较等操作数形式 × 全部适用条件，共 2048 个检查；原生后端必须与 `-drc_use_c` 的结果一致。此外还有一个跨越块内 `HANDLE` 回退路径的活性用例，确保 CFG 分析不会漏掉该路径上的标志位读取。
 
 测试驱动通过 `src/mame/mame.lst` 注册为 `drc_condtest`，并在 `scripts/src/cpu.lua` 中为这个 subtarget 显式启用 DRC 核心；测试本身不实例化 MIPS3 或其他 guest CPU。
 
@@ -650,4 +650,4 @@ drc_specifictest: PASS (8 dword reads + 8 dword writes + mask-sensitive register
 
 - POWERPC、UNSP、ADSP(SHARC)、DSPP 的真实 ROM 回归尚未完成；拿到合法 ROM/可构建的开源测试程序后，继续按 9.4.1 的用例清单做 native vs `-drc_use_c` A/B。
 - `lagoon.c` 只在 Debug 和 `drc_*test` 测试构建中用 `-DLA_DEBUG` 编译（测试的 Release 构建通过 `-UNDEBUG` 保持断言，Release `mame` 不带 `LA_DEBUG`）；`la_load_immediate32/64()` 的 20/12 位立即数已按 9.4.7 完成符号扩展修正。
-- 已实现 `emit_skip` 标志位直接分支、`CMP/TEST + JMPc` 融合、CMP/TEST 常量折叠和远端条件分支的分支岛；标志位活性检查目前跟随 UML 优化器的线性模型，后续可扩展为更精确的 CFG 数据流分析。
+- 已实现 `emit_skip` 标志位直接分支、`CMP/TEST + JMPc` 融合、CMP/TEST 常量折叠和远端条件分支的分支岛；标志位活性检查已从跟随 UML 优化器的线性模型扩展为基于控制流图的迭代数据流分析，覆盖条件跳转、条件退出/返回、调用以及循环回边。

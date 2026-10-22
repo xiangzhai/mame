@@ -408,8 +408,8 @@ private:
 	void emit_condition(lagoon_assembler_t &a, uml::condition_t cond, la_gpr_t dst);
 
 	// CMP/TEST + conditional branch peephole
-	bool try_fuse_cmp_branch(lagoon_assembler_t &a, const uml::instruction *instlist, uint32_t numinst, uint32_t inum, uint32_t &consumed);
-	bool flags_dead_from(const uml::instruction *instlist, uint32_t numinst, uint32_t start, uint8_t flags, std::vector<bool> &visited) const;
+	std::vector<uint8_t> analyze_flag_liveness(const uml::instruction *instlist, uint32_t numinst) const;
+	bool try_fuse_cmp_branch(lagoon_assembler_t &a, const uml::instruction *instlist, uint32_t numinst, uint32_t inum, std::vector<uint8_t> const &flag_live_in, uint32_t &consumed);
 	bool emit_cmp_branch(lagoon_assembler_t &a, uml::condition_t cond, const be_parameter &src1p, const be_parameter &src2p, uint32_t size, lagoon_label_t &target);
 	bool emit_test_branch(lagoon_assembler_t &a, uml::condition_t cond, const be_parameter &src1p, const be_parameter &src2p, uint32_t size, lagoon_label_t &target);
 
@@ -1601,6 +1601,7 @@ void drcbe_la64::generate(drcuml_block &block, const instruction *instlist, uint
 	la_init_assembler(&a, base, capacity);
 
 	std::vector<std::tuple<uint8_t *, uint8_t *, std::string>> log_entries;
+	std::vector<uint8_t> const flag_live_in = analyze_flag_liveness(instlist, numinst);
 
 	for (uint32_t inum = 0; inum < numinst; inum++)
 	{
@@ -1620,7 +1621,7 @@ void drcbe_la64::generate(drcuml_block &block, const instruction *instlist, uint
 
 		uint8_t *before = a.cursor;
 		uint32_t consumed = 1;
-		if (!try_fuse_cmp_branch(a, instlist, numinst, inum, consumed))
+		if (!try_fuse_cmp_branch(a, instlist, numinst, inum, flag_live_in, consumed))
 			generate_one(a, inst);
 		inum += consumed - 1;
 
@@ -1992,76 +1993,106 @@ void drcbe_la64::op_jmp(lagoon_assembler_t &a, const uml::instruction &inst)
 	la_label_free(&a, &skip);
 }
 
-bool drcbe_la64::flags_dead_from(const uml::instruction *instlist, uint32_t numinst, uint32_t start, uint8_t flags, std::vector<bool> &visited) const
+std::vector<uint8_t> drcbe_la64::analyze_flag_liveness(const uml::instruction *instlist, uint32_t numinst) const
 {
-	uint32_t pc = start;
-	while (pc < numinst)
+	std::vector<uint8_t> live_in(numinst, 0);
+	std::vector<uint32_t> jump_target(numinst, numinst);
+	std::map<uint32_t, uint32_t> labels;
+
+	for (uint32_t index = 0; index < numinst; index++)
 	{
-		if (visited[pc])
-			return true;
-		visited[pc] = true;
+		uml::instruction const &inst = instlist[index];
+		if (inst.opcode() == uml::OP_LABEL)
+			labels.emplace(uint32_t(inst.param(0).label()), index);
+	}
 
-		uml::instruction const &inst = instlist[pc];
-		switch (inst.opcode())
-		{
-		case uml::OP_HANDLE:
-			// a new entry point; flags are not part of the block entry state
-			return true;
-
-		case uml::OP_LABEL:
-		case uml::OP_COMMENT:
-		case uml::OP_MAPVAR:
-		case uml::OP_HASH:
-		case uml::OP_NOP:
-			pc++;
-			continue;
-
-		default:
-			break;
-		}
-
-		// if anything reads the flags before they can be overwritten, they are live
-		if (inst.input_flags() & flags)
-			return false;
-
-		// unconditional instructions that write flags kill the old values
-		if (inst.condition() == uml::COND_ALWAYS && (inst.modified_flags() & flags))
-			return true;
-
-		// follow intra-block jumps; flags are part of the path
+	for (uint32_t index = 0; index < numinst; index++)
+	{
+		uml::instruction const &inst = instlist[index];
 		if (inst.opcode() == uml::OP_JMP)
 		{
-			uint32_t const target = find_label_index(instlist, numinst, inst.param(0).label());
-			if (target >= numinst)
-				return false;
-			if (!flags_dead_from(instlist, numinst, target, flags, visited))
-				return false;
-			if (inst.condition() == uml::COND_ALWAYS)
-				return true;
-			pc++;
-			continue;
+			auto const target = labels.find(uint32_t(inst.param(0).label()));
+			if (target != labels.end())
+				jump_target[index] = target->second;
 		}
-
-		switch (inst.opcode())
-		{
-		case uml::OP_EXIT:
-		case uml::OP_HASHJMP:
-		case uml::OP_RET:
-			// control leaves the block; the software flags are block-local
-			return true;
-
-		case uml::OP_EXH:
-		case uml::OP_CALLH:
-			// callee may consume the flags; keep the computation
-			return false;
-
-		default:
-			break;
-		}
-
-		pc++;
 	}
-	return true;
+
+	bool changed = true;
+	while (changed)
+	{
+		changed = false;
+		for (uint32_t index = numinst; index-- > 0; )
+		{
+			uml::instruction const &inst = instlist[index];
+			uint8_t use = inst.input_flags();
+			uint8_t kill = inst.modified_flags();
+			uint32_t target = numinst;
+			bool fallthrough = true;
+
+			switch (inst.opcode())
+			{
+			case uml::OP_EXIT:
+				kill = 0;
+				fallthrough = (inst.condition() != uml::COND_ALWAYS);
+				break;
+
+			case uml::OP_HASHJMP:
+				use = 0;
+				kill = 0;
+				fallthrough = false;
+				break;
+
+			case uml::OP_JMP:
+				kill = 0;
+				target = jump_target[index];
+				if (target >= numinst)
+					use |= uml::FLAGS_ALL;
+				fallthrough = (inst.condition() != uml::COND_ALWAYS);
+				break;
+
+			case uml::OP_EXH:
+				use |= uml::FLAGS_ALL;
+				kill = 0;
+				fallthrough = (inst.condition() != uml::COND_ALWAYS);
+				break;
+
+			case uml::OP_CALLH:
+				use |= uml::FLAGS_ALL;
+				kill = uml::FLAGS_ALL;
+				fallthrough = true;
+				break;
+
+			case uml::OP_RET:
+				kill = (inst.condition() == uml::COND_ALWAYS) ? uint8_t(uml::FLAGS_ALL) : uint8_t(0);
+				fallthrough = (inst.condition() != uml::COND_ALWAYS);
+				break;
+
+			case uml::OP_CALLC:
+				kill = 0;
+				fallthrough = true;
+				break;
+
+			default:
+				if (inst.condition() != uml::COND_ALWAYS)
+					kill = 0;
+				break;
+			}
+
+			uint8_t live = use;
+			uint8_t const survive = uint8_t(~kill);
+			if (target < numinst)
+				live |= live_in[target] & survive;
+			if (fallthrough && ((index + 1) < numinst))
+				live |= live_in[index + 1] & survive;
+			if (live != live_in[index])
+			{
+				live_in[index] = live;
+				changed = true;
+			}
+		}
+	}
+
+	return live_in;
 }
 
 
@@ -2158,7 +2189,7 @@ bool drcbe_la64::emit_test_branch(lagoon_assembler_t &a, uml::condition_t cond, 
 }
 
 
-bool drcbe_la64::try_fuse_cmp_branch(lagoon_assembler_t &a, const uml::instruction *instlist, uint32_t numinst, uint32_t inum, uint32_t &consumed)
+bool drcbe_la64::try_fuse_cmp_branch(lagoon_assembler_t &a, const uml::instruction *instlist, uint32_t numinst, uint32_t inum, std::vector<uint8_t> const &flag_live_in, uint32_t &consumed)
 {
 	uml::instruction const &inst = instlist[inum];
 	bool const is_cmp = (inst.opcode() == uml::OP_CMP);
@@ -2185,11 +2216,9 @@ bool drcbe_la64::try_fuse_cmp_branch(lagoon_assembler_t &a, const uml::instructi
 	if (targetindex >= numinst)
 		return false;
 
-	std::vector<bool> visited(numinst, false);
-	if (!flags_dead_from(instlist, numinst, inum + 2, cmpflags, visited))
+	if (((inum + 2) < numinst) && (flag_live_in[inum + 2] & produced))
 		return false;
-	visited.assign(numinst, false);
-	if (!flags_dead_from(instlist, numinst, targetindex, cmpflags, visited))
+	if (flag_live_in[targetindex] & produced)
 		return false;
 
 	be_parameter src1p(*this, inst.param(0), PTYPE_MRI);

@@ -57,9 +57,11 @@ private:
 	drc_cache m_cache;
 	std::unique_ptr<drcuml_state> m_drcuml;
 	uml::code_handle *m_entry = nullptr;
+	uml::code_handle *m_aux = nullptr;
 	int m_label = 0;
 	int m_fusion_count = 0;
 
+	u32 m_cfg_result = 0;
 	std::array<u32, COND_COUNT * FLAG_COUNT> m_set_results{};
 	std::array<u32, COND_COUNT * FLAG_COUNT> m_jump_results{};
 	std::array<u32, MAX_FUSION_CASES> m_fusion_results{};
@@ -210,6 +212,7 @@ void drc_condtest_state::machine_start()
 	uint32_t const flags = 0;
 	m_drcuml = std::make_unique<drcuml_state>(*this, m_cache, flags, 8, 32, 2, 0x1000);
 	m_entry = m_drcuml->handle_alloc("entry");
+	m_aux = m_drcuml->handle_alloc("aux");
 
 	drcuml_block &block = m_drcuml->begin_block(65536);
 	UML_HANDLE(block, *m_entry);
@@ -352,6 +355,24 @@ void drc_condtest_state::machine_start()
 		}
 	}
 
+	{
+		uml::code_label const target = m_label++;
+		uml::code_label const done = m_label++;
+
+		UML_SETFLGS(block, 0);
+		UML_MOV(block, uml::I0, 1);
+		UML_MOV(block, uml::I1, 2);
+		UML_CMP(block, uml::I0, uml::I1);
+		UML_JMPc(block, uml::COND_Z, target);
+		UML_HANDLE(block, *m_aux);
+		UML_SETc(block, uml::COND_S, uml::I2);
+		UML_JMP(block, done);
+		UML_LABEL(block, target);
+		UML_MOV(block, uml::I2, 7);
+		UML_LABEL(block, done);
+		UML_STORE(block, &m_cfg_result, 0, uml::I2, SIZE_DWORD, SCALE_x1);
+	}
+
 	UML_EXIT(block, 0);
 	block.end();
 
@@ -373,6 +394,12 @@ void drc_condtest_state::machine_start()
 						fusion_index, m_fusion_expected[fusion_index], m_fusion_results[fusion_index]);
 			errors++;
 		}
+	}
+
+	if (m_cfg_result != 1)
+	{
+		osd_printf_error("drc_condtest: CFG liveness case: expected 1, got %u\n", m_cfg_result);
+		errors++;
 	}
 
 	if (errors != 0)
