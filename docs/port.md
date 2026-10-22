@@ -512,9 +512,63 @@ load_imm32(a, REG_PARAM4, uint32_t((uint64_t(1) << (accessors.specific.native_by
 - 第 20、60、120 帧的 workram_l、workram_h、sound RAM、backup RAM 以及 VDP/SCU 寄存器 dump 全部一致。
 - 原生后端连续运行 30 秒正常退出，退出码 0。
 
-### 9.4 后续工作
+### 9.4 多前端定向回归与真实 ROM 验证
 
-- SH-2 已通过 `diehard` 实测；继续用 POWERPC、SH4、UNSP、ADSP、DSPP 等前端做回归，重点覆盖 BFXU/BFXS、ROLAND/ROLINS、ROLC/RORC、64 位 DIV/MUL、SAVE/RESTORE、异常路径和 `RECOVER`。
+本轮回归不再只依赖 MIPS3 合成用例，而是分为 UML 定向用例和真实 ROM 两部分。测试驱动和日志均为临时验证代码，完成后已从仓库移除。
+
+#### 9.4.1 UML 定向一致性测试
+
+临时驱动直接构造 `drcuml_state` / `drcuml_block`，用同一份 UML 序列分别走原生后端和 `-drc_use_c`，逐项比较 I0-I9、F0-F9、flags、fmod、exp 和执行结果。共 499 个用例，覆盖：
+
+- `BFXU`/`BFXS` 32/64 位，含可变 shift/width、符号扩展边界和 `DBFXS` 化简为 `DSEXT` 的路径。
+- `ROLAND`/`ROLINS` 32/64 位，含寄存器 dst、内存 dst、保留位插入和 `dst == src`。
+- `ROLC`/`RORC` 32/64 位，count 覆盖 0、1、2、7、31、32、63、64、65，carry 输入 0/1。
+- `MULU`/`MULS`/`MULULW`/`MULSLW`、`DIVU`/`DIVS` 的 32/64 位高/低结果、商/余数、除零置 V，以及 32 位脏高位的零扩展。
+- `SAVE`/`RESTORE` 覆盖 I0-I9、F0-F9、flags、fmod、exp。
+- `CALLH`/`RET`、`EXH`/`EXHc`、`RECOVER`；其中还验证了嵌套 `CALLH` 子程序中的 `RECOVER` 仍恢复最外层异常调用点的 mapvar。
+
+结果：**499/499 全部一致**，原生后端执行结果 `0x5A`，与 C 后端相同。
+
+回归过程中发现并修复了三个问题：
+
+1. **`op_sext` 破坏源寄存器**：当源是直接映射寄存器且 `size < inst.size()` 时，原实现把源寄存器本身当作临时寄存器，并写入 32 位值，导致高 32 位被截断。UML 优化器把 `DBFXS dst,src,0,8` 化简为 `DSEXT dst,src,byte` 后会触发，例如 `I1 = 0x0123456789abcdef` 被改成 `0x89abcdef`。修复为始终使用 `TEMP_REG1` 作为临时寄存器。
+2. **`op_recover` 取错返回地址**：原实现从 `[top_sp - 8]` 取地址，实际取到 entry handle 的返回地址，`drc_map_variables::get_value` 找不到对应 mapvar，`RECOVER` 返回 0。修复为使用最外层生成代码子程序帧的返回地址 `[top_sp - (HANDLE_FRAME_SIZE + 8)]`；这与 C 后端 `callstack[0]` 的语义一致，嵌套 `CALLH` 中的 `RECOVER` 也能恢复最外层 `EXH` 调用点。
+3. **C 后端 64 位 `DROLC` 的移位未定义行为**：`(flags & FLAG_C) << (shift - 1)` 使用有符号 `int` 移位，`shift - 1` 为 31/62 时产生未定义行为；在 LoongArch 上会符号扩展到 64 位，例如 count=32、carry=1 得到 `0xffffffffc0000000` 而不是 `0x00000001c0000000`。修复为移位前 cast 到 `uint32_t`/`uint64_t`。该修复同时提高了 C 后端作为 A/B 参考的可靠性。
+
+#### 9.4.2 SH-2 真实游戏 `diehard`
+
+使用已有的 ST-V `diehard`（SH7604/SH-2）分别运行原生后端和 `-drc_use_c`，通过 Lua 脚本在固定帧 dump `workram_l`、`workram_h`、sound RAM：
+
+```sh
+./mame diehard -rompath roms -video none -sound none -nothrottle \
+    -autoboot_script dump.lua
+./mame diehard -rompath roms -video none -sound none -nothrottle -drc_use_c \
+    -autoboot_script dump.lua
+```
+
+结果：
+
+- 第 20、120 帧的 3 MB dump 完全一致。
+- 第 60 帧有 3 字节差异（`workram_h` 的 `0x06000708`、`0x0600070a`、`0x06002864`）；同一配置重复运行结果稳定。该帧 native/C 与 `-nodrc` 也都有差异，初步判断是 DRC 路径的暂态值或调度时序差异，未按后端语义错误处理，后续可用更精确的帧同步继续确认。
+
+#### 9.4.3 SH4 真实硬件诊断 ROM `NaomiDIAG`
+
+使用开源 Sega Naomi 诊断 BIOS `NaomiDIAG_EN.bin`（`Guimli/NaomiDIAG`）替换 `naomi.zip` 中的 `epr-21576h.ic27`。由于没有原版 JVS/MIE/Altera ROM，使用了同尺寸占位文件，MAME 会报告 CRC 不匹配；但 SH-4 代码路径是真实执行的，`-drc_log_native` 生成了 `drcbela64_sh7091_maincpu.asm`，确认走的是 LoongArch64 原生后端。
+
+在固定第 600 帧 dump `0x0C000000` 起的主 RAM 前 1 MB 和 `0x04000000` 起的 texture RAM 前 1 MB，共 2 MB：
+
+- 原生后端与 `-drc_use_c` 的 dump **逐字节一致**。
+- 原生后端平均速度约 24%，`-drc_use_c` 约 15%，与“原生 JIT 实际执行”一致。
+
+#### 9.4.4 未完成的真实 ROM 覆盖
+
+- **POWERPC**：没有可直接使用的合法商业 ROM；开源 `trzy/model3`（Sega Model 3 / PPC603e 测试程序）需要 `powerpc-603e-eabi` 交叉工具链，当前环境未构建，因此未做真实运行。
+- **UNSP、ADSP(SHARC)、DSPP**：没有对应的合法 ROM/测试 ROM。
+- 这些前端重点使用的 `BFXU`/`BFXS`、`ROLAND`/`ROLINS`、`ROLC`/`RORC`、64 位 `DIV`/`MUL`、`SAVE`/`RESTORE`、异常路径和 `RECOVER` 已由 9.4.1 的 UML 定向用例覆盖；后续拿到 ROM 后仍需补做真实前端 A/B。
+
+### 9.5 后续工作
+
+- POWERPC、UNSP、ADSP(SHARC)、DSPP 的真实 ROM 回归尚未完成；拿到合法 ROM/可构建的开源测试程序后，继续按 9.4.1 的用例清单做 native vs `-drc_use_c` A/B。
 - 为 `COND_A`/`COND_BE` 等条件码补充独立的标志位组合测试，避免只靠 MIPS3 用例覆盖。
 - 为 `specific_access_info` 快速路径补充 32 位读写掩码的独立测试，并在真实游戏验证中同时检查画面和关键内存/寄存器内容，避免“不崩溃但读错/写丢”的问题再次漏过。
 - 开发期建议用 `-DLA_DEBUG` 编译 `lagoon.c`，让立即数越界尽早断言。
