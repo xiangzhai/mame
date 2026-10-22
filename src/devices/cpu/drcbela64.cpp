@@ -3466,7 +3466,7 @@ void drcbe_la64::op_read(lagoon_assembler_t &a, const uml::instruction &inst)
 		if (accessors.specific.native_bytes >= 8)
 			load_imm64(a, REG_PARAM3, ~uint64_t(0));
 		else
-			load_imm32(a, REG_PARAM3, (1u << (accessors.specific.native_bytes * 8)) - 1);
+			load_imm32(a, REG_PARAM3, uint32_t((uint64_t(1) << (accessors.specific.native_bytes * 8)) - 1));
 		emit_specific_call(a, accessors.specific.read);
 	}
 	else
@@ -3591,7 +3591,7 @@ void drcbe_la64::op_write(lagoon_assembler_t &a, const uml::instruction &inst)
 		if (accessors.specific.native_bytes >= 8)
 			load_imm64(a, REG_PARAM4, ~uint64_t(0));
 		else
-			load_imm32(a, REG_PARAM4, (1u << (accessors.specific.native_bytes * 8)) - 1);
+			load_imm32(a, REG_PARAM4, uint32_t((uint64_t(1) << (accessors.specific.native_bytes * 8)) - 1));
 		emit_specific_call(a, accessors.specific.write);
 	}
 	else

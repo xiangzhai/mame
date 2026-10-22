@@ -472,10 +472,51 @@ MIPS3 验证使用临时编写的 MIPS R4600BE 测试驱动（`-drc_use_c` 与�
 
 在 SH-2 的 `write32` handle 中，地址 `0x60000000` 本应因大于 fastram 结束地址而跳过 workram 快速路径，但错误的 `COND_A` 使它落入快速路径，用 `fastbase + address` 访问未映射的宿主地址并崩溃。修正 `src/devices/cpu/drcbela64.cpp:713` 后，`diehard` 连续运行 30 秒正常退出。
 
+需要说明的是，上面的实测使用 `-video none -sound none`，只能证明“不崩溃、能跑完”，不能证明内存访问和画面正确。后续补做画面与内存内容对比时，发现了一个不会崩溃但会导致黑屏的问题。
+
+#### 9.3.3 STV 黑屏问题与修复（32 位 specific 访问掩码）
+
+问题现象：
+
+- 原生后端运行 `diehard` 时输出纯黑画面，AVI 每帧像素均值均为 0。
+- 加 `-drc_use_c` 后可以正常显示 ST-V 的 FBI 启动画面，说明游戏/驱动本身没有问题。
+- 逐帧对比共享内存发现：第 18 帧之前 workram_l、workram_h、sound RAM、backup RAM 完全一致；第 19 帧开始 `workram_h` 出现分叉，例如 `0x06002CA4` 处 C 后端为 `0x25A004xx`，原生后端为 `0x25A00000`。进一步定位到指针表构建代码读取 sound RAM 时，C 后端读到 `0x00000700`，原生后端读到 0；VDP/SCU 寄存器也在同一时期开始分叉，最终导致 VDP 未正确初始化而黑屏。
+
+根因：
+
+`drcbe_la64::op_read()` 和 `op_write()` 在“访问宽度等于 address space 原生宽度”的 `specific_access_info` 快速路径中，用 32 位常量构造访问掩码：
+
+```cpp
+(1u << (accessors.specific.native_bytes * 8)) - 1
+```
+
+当 `native_bytes == 4` 时，`1u << 32` 是 C++ 未定义行为；当前 LoongArch 构建实际得到 0。结果传给 `handler_entry_read/write` 的 `mem_mask` 恒为 0：
+
+- 32 位 specific 读取不再命中任何 subunit，返回未映射值 0（sound RAM、VDP、SCU、SCSP 等）；
+- 32 位 specific 写入的数据被掩掉，写不进相应设备；
+- fastram 路径不使用该掩码，因此 BIOS/游戏仍能继续执行，表现为“能跑但黑屏”，而不是崩溃。
+
+修复：
+
+```cpp
+// src/devices/cpu/drcbela64.cpp
+load_imm32(a, REG_PARAM3, uint32_t((uint64_t(1) << (accessors.specific.native_bytes * 8)) - 1)); // op_read
+load_imm32(a, REG_PARAM4, uint32_t((uint64_t(1) << (accessors.specific.native_bytes * 8)) - 1)); // op_write
+```
+
+即先用 64 位计算 `2^(native_bytes*8)-1`，再截断到 32 位，避免移位位数等于类型宽度时的未定义行为。修改位置为 `src/devices/cpu/drcbela64.cpp:3469` 和 `:3594`。
+
+验证结果：
+
+- 原生后端与 `-drc_use_c` 在 5 秒、10 秒的截图逐像素一致，`magick compare -metric AE` 为 `0 (0)`。
+- 第 20、60、120 帧的 workram_l、workram_h、sound RAM、backup RAM 以及 VDP/SCU 寄存器 dump 全部一致。
+- 原生后端连续运行 30 秒正常退出，退出码 0。
+
 ### 9.4 后续工作
 
 - SH-2 已通过 `diehard` 实测；继续用 POWERPC、SH4、UNSP、ADSP、DSPP 等前端做回归，重点覆盖 BFXU/BFXS、ROLAND/ROLINS、ROLC/RORC、64 位 DIV/MUL、SAVE/RESTORE、异常路径和 `RECOVER`。
 - 为 `COND_A`/`COND_BE` 等条件码补充独立的标志位组合测试，避免只靠 MIPS3 用例覆盖。
+- 为 `specific_access_info` 快速路径补充 32 位读写掩码的独立测试，并在真实游戏验证中同时检查画面和关键内存/寄存器内容，避免“不崩溃但读错/写丢”的问题再次漏过。
 - 开发期建议用 `-DLA_DEBUG` 编译 `lagoon.c`，让立即数越界尽早断言。
 - 当前实现以正确性优先，未做 CMP+条件分支融合、常量折叠和分支岛等优化；后续可以在 `emit_skip`/`op_jmp` 与 CMP/TEST 上做 peephole。
 - 如需在同一个后端实例上递归 `execute()`，顶层 SP 目前保存在 near cache 中，建议后续改为保存到保留的 callee-saved 寄存器或显式保存栈，以避免递归覆盖。
