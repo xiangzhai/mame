@@ -10,6 +10,15 @@ static void emit32(lagoon_assembler_t* assembler, uint32_t instruction)
     assembler->cursor += 4;
 }
 
+static int32_t la_sign_extend(uint64_t value, unsigned bits)
+{
+    uint64_t mask = (1ULL << bits) - 1;
+    int64_t sign = (int64_t)(1ULL << (bits - 1));
+
+    value &= mask;
+    return (int32_t)(((int64_t)value ^ sign) - sign);
+}
+
 static int32_t la_pcala_hi20(uintptr_t target, uintptr_t pc)
 {
     intptr_t target_page = (intptr_t)((target + 0x800) & ~(uintptr_t)0xfff);
@@ -260,26 +269,26 @@ void la_load_immediate32(lagoon_assembler_t* assembler, la_gpr_t rd, int32_t val
     if ((val & 0xfff) == val) {
         la_ori(assembler, rd, LA_ZERO, val);
     } else if (((val << 20) >> 20) == val) {
-        la_addi_w(assembler, rd, LA_ZERO, val & 0xfff);
+        la_addi_w(assembler, rd, LA_ZERO, val);
     } else if ((val & 0xfff) == 0) {
-        la_lu12i_w(assembler, rd, (val >> 12) & 0xfffff);
+        la_lu12i_w(assembler, rd, la_sign_extend((uint32_t)val >> 12, 20));
     } else {
-        la_lu12i_w(assembler, rd, (val >> 12) & 0xfffff);
+        la_lu12i_w(assembler, rd, la_sign_extend((uint32_t)val >> 12, 20));
         la_ori(assembler, rd, rd, val & 0xfff);
     }
 }
 
 void la_load_immediate64(lagoon_assembler_t* assembler, la_gpr_t rd, int64_t val)
 {
-    la_load_immediate32(assembler, rd, val);
+    la_load_immediate32(assembler, rd, (int32_t)val);
     if (((val << 32) >> 32) == val) {
         return;
     }
-    la_lu32i_d(assembler, rd, (val >> 32) & 0xfffff);
+    la_lu32i_d(assembler, rd, la_sign_extend((uint64_t)val >> 32, 20));
     if (((val << 12) >> 12) == val) {
         return;
     }
-    la_lu52i_d(assembler, rd, rd, (val >> 52) & 0xfff);
+    la_lu52i_d(assembler, rd, rd, la_sign_extend((uint64_t)val >> 52, 12));
 }
 
 void la_la_local(lagoon_assembler_t* assembler, la_gpr_t rd, ptrdiff_t offset)

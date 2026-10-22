@@ -1992,6 +1992,17 @@ project "lagoon"
 	uuid "4a0d6c9d-7f5a-4f42-9a4e-51e0f6d3c2b1"
 	kind "StaticLib"
 
+	defines {
+		"LA_DEBUG",
+	}
+
+	configuration { "gmake or ninja or jcdb" }
+		buildoptions {
+			"-UNDEBUG",
+		}
+
+	configuration { }
+
 	includedirs {
 		MAME_DIR .. "3rdparty/lagoon",
 	}
