@@ -48,7 +48,7 @@ LoongArch64 ABI（LP64D）：
 | zero / ra / tp / sp | `$r0` / `$r1` / `$r2` / `$r3` |
 | 参数 | `$a0-$a7` = `$r4-$r11` |
 | 临时 | `$t0-$t8` = `$r12-$r20` |
-| 保留 | `$r21`（不要用） |
+| 后端专用 | `$r21`（ABI 保留，保存顶层栈帧指针） |
 | frame pointer | `$fp` = `$r22`（callee-saved） |
 | callee-saved | `$s0-$s8` = `$r23-$r31` |
 | 浮点 | `$f0-$f31`；`$fa0-$fa7`、`$ft0-$ft15`、`$fs0-$fs7` |
@@ -60,10 +60,11 @@ I0..I7   -> $s0..$s7      // 8 个直接映射，够 MIPS3/PPC 前端用
 FLAGS    -> $s8
 BASE     -> $fp ($r22)    // 指向 cache.near()+0x100，callee-saved，helper 调用不会破坏
 TEMP     -> $t0..$t8
+TOP_SP   -> $r21          // ABI 保留，入口保存/恢复原值，递归 execute 不会互相覆盖
 F0..F7   -> $fs0..$fs7
 ```
 
-`get_info()` 返回 `direct_iregs=8, direct_fregs=8`；MIPS3/PPC 前端会根据这个值把 guest 寄存器放进直接映射（见 `src/devices/cpu/mips/mips3.cpp:589`、`powerpc/ppccom.cpp:945`）。`$r21` 和 `$tp` 不要碰。
+`get_info()` 返回 `direct_iregs=8, direct_fregs=8`；MIPS3/PPC 前端会根据这个值把 guest 寄存器放进直接映射（见 `src/devices/cpu/mips/mips3.cpp:589`、`powerpc/ppccom.cpp:945`）。`$r21` 被后端占用为顶层栈帧指针（入口保存/恢复调用者的原值），`$tp` 不要碰。
 
 ### 3.2 flags 和进位（最大难点）
 
@@ -409,11 +410,11 @@ src/lib/util/abi.h               # 修正 LoongArch 成员函数指针布局
 
 ### 9.2 后端实现要点
 
-- 寄存器映射与报告一致：`I0-I7 -> $s0-$s7`，`FLAGS -> $s8`，`BASE -> $fp`，临时寄存器使用 `$t0-$t8`，`F0-F7 -> $fs0-$fs7`；`get_info()` 返回 `direct_iregs = 8`、`direct_fregs = 8`。
+- 寄存器映射与报告一致：`I0-I7 -> $s0-$s7`，`FLAGS -> $s8`，`BASE -> $fp`，`TOP_SP -> $r21`，临时寄存器使用 `$t0-$t8`，`F0-F7 -> $fs0-$fs7`；`get_info()` 返回 `direct_iregs = 8`、`direct_fregs = 8`。
 - flags 完全软件维护在 `$s8`，位布局与 `uml::FLAG_BIT_*` 一致；ADDC/SUBB 的进位、移位/旋转产生的进位都按 `drcbec.cpp` 的语义实现。
 - 所有 32 位整数运算结果用 `bstrpick.d rd, rd, 31, 0` 零扩展到 64 位，避免 LoongArch `*.w` 指令的符号扩展污染后续地址计算和比较。
-- 顶层入口建立 160 字节栈帧，保存 `$ra`、`$fp`、`$s0-$s8`、`$fs0-$fs7`；handle 子程序使用 16 字节小帧。`m_near` 保存原始 FCSR 和顶层 SP，退出时恢复 SP、FCSR 和所有 callee-saved 寄存器。
-- `m_exit` 会先把 `$sp` 恢复到顶层 SP。这样即使 `EXIT` 发生在 `CALLH`/`EXH` 的 handle 内部而没有 `RET`，也不会读到错误的栈帧。
+- 顶层入口建立 160 字节栈帧，保存 `$ra`、`$fp`、`$r21`、`$s0-$s8`、`$fs0-$fs7`；handle 子程序使用 16 字节小帧。顶层栈帧指针保存在 `$r21`（ABI 保留寄存器，helper 调用不会破坏），入口把调用者的 `$r21` 存入栈帧、退出时恢复，因此递归 `execute()` 不会互相覆盖；`m_near` 只保存原始 FCSR。退出时先由 `$r21` 恢复 `$sp`，再恢复 FCSR 和所有 callee-saved 寄存器。
+- `m_exit` 会先把 `$sp` 恢复到 `$r21` 指向的顶层帧。这样即使 `EXIT` 发生在 `CALLH`/`EXH` 的 handle 内部而没有 `RET`，也不会读到错误的栈帧；`op_recover` 同样从 `$r21` 计算最外层子程序帧的返回地址。
 - FCSR 的 RM 字段按 `fmod ^ 1` 映射（UML trunc/round/ceil/floor -> LoongArch RZ/RNE/RP/RM）；`SETFMOD`、`RESTORE`、入口和 helper 调用前后都会同步宿主 FCSR。
 - 内存访问对“访问宽度等于 address space 原生宽度”的情况走 `specific_access_info` 快速路径，窄访问和非原生宽度、masked 访问走 `resolved_memory_accessors` 通用路径。
 - `-drc_log_native` 使用 lagoon 的 `la_disasm_one()`/`la_insn_to_str()` 输出反汇编；transient block 会等所有 label 回填完成后再输出，避免日志里看到未回填的 `b 0`。
@@ -650,4 +651,3 @@ drc_specifictest: PASS (8 dword reads + 8 dword writes + mask-sensitive register
 - POWERPC、UNSP、ADSP(SHARC)、DSPP 的真实 ROM 回归尚未完成；拿到合法 ROM/可构建的开源测试程序后，继续按 9.4.1 的用例清单做 native vs `-drc_use_c` A/B。
 - `lagoon.c` 只在 Debug 和 `drc_*test` 测试构建中用 `-DLA_DEBUG` 编译（测试的 Release 构建通过 `-UNDEBUG` 保持断言，Release `mame` 不带 `LA_DEBUG`）；`la_load_immediate32/64()` 的 20/12 位立即数已按 9.4.7 完成符号扩展修正。
 - 已实现 `emit_skip` 标志位直接分支、`CMP/TEST + JMPc` 融合、CMP/TEST 常量折叠和远端条件分支的分支岛；标志位活性检查目前跟随 UML 优化器的线性模型，后续可扩展为更精确的 CFG 数据流分析。
-- 如需在同一个后端实例上递归 `execute()`，顶层 SP 目前保存在 near cache 中，建议后续改为保存到保留的 callee-saved 寄存器或显式保存栈，以避免递归覆盖。

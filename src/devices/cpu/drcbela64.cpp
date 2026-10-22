@@ -17,6 +17,7 @@ r1      ra
 r3      sp
 r4-r11  a0-a7       parameters/scratch
 r12-r20 t0-t8       temporaries/scratch
+r21                 top-level frame stack pointer (reserved by the ABI)
 r22     fp          near cache base pointer
 r23-r30 s0-s7       UML registers I0-I7
 r31     s8          software emulated flags
@@ -97,6 +98,11 @@ const la_fpr_t TEMPF_REG3 = LA_FT2;
 // Base memory address
 const la_gpr_t BASE_REG = LA_FP;
 
+// Top-level frame stack pointer.  r21 is reserved by the ABI and therefore
+// survives calls to backend helpers; each entry point still saves and
+// restores the caller's value so recursive execution nests correctly.
+const la_gpr_t TOP_SP_REG = LA_RX;
+
 // Software emulated flags
 const la_gpr_t FLAGS_REG = LA_S8;
 
@@ -117,6 +123,7 @@ constexpr int TOP_FRAME_SIZE = 160;
 constexpr int TOP_FRAME_RA = 0;
 constexpr int TOP_FRAME_FP = 8;
 constexpr int TOP_FRAME_S0 = 16;
+constexpr int TOP_FRAME_TOP_SP = 88;
 constexpr int TOP_FRAME_FS0 = 96;
 
 // Stack frame used by generated code subroutines (CALLH/EXH/HASHJMP targets)
@@ -357,7 +364,6 @@ private:
 	struct near_state
 	{
 		uint64_t saved_fcsr;
-		uintptr_t top_sp;
 	};
 
 	struct memory_accessors
@@ -1476,10 +1482,14 @@ void drcbe_la64::emit_invariant_code(lagoon_assembler_t &a, uint8_t *dst)
 	la_addi_d(&a, LA_SP, LA_SP, -TOP_FRAME_SIZE);
 	la_st_d(&a, LA_RA, LA_SP, TOP_FRAME_RA);
 	la_st_d(&a, LA_FP, LA_SP, TOP_FRAME_FP);
+	la_st_d(&a, TOP_SP_REG, LA_SP, TOP_FRAME_TOP_SP);
 	for (int reg = 0; reg < 9; reg++)
 		la_st_d(&a, la_gpr_t(LA_S0 + reg), LA_SP, TOP_FRAME_S0 + (8 * reg));
 	for (int reg = 0; reg < 8; reg++)
 		la_fst_d(&a, la_fpr_t(LA_FS0 + reg), LA_SP, TOP_FRAME_FS0 + (8 * reg));
+
+	// remember this invocation's top-level frame for EXIT and RECOVER
+	la_move(&a, TOP_SP_REG, LA_SP);
 
 	// save the incoming FCSR and establish the initial rounding mode
 	la_movfcsr2gr(&a, TEMP_REG1, LA_FCSR0);
@@ -1489,9 +1499,6 @@ void drcbe_la64::emit_invariant_code(lagoon_assembler_t &a, uint8_t *dst)
 	load_imm64(a, BASE_REG, uintptr_t(m_baseptr));
 	la_move(&a, FLAGS_REG, LA_ZERO);
 	emit_sync_fcsr(a);
-
-	load_address(a, TEMP_REG1, uintptr_t(&m_near.top_sp));
-	la_st_d(&a, LA_SP, TEMP_REG1, 0);
 
 	// call the generated entry point (entry in a0)
 	la_jirl(&a, LA_RA, REG_PARAM1, 0);
@@ -1503,13 +1510,13 @@ void drcbe_la64::emit_invariant_code(lagoon_assembler_t &a, uint8_t *dst)
 	la_movgr2fcsr(&a, LA_FCSR0, TEMP_REG1);
 
 	// discard any outstanding generated subroutines and return to the top-level frame
-	load_address(a, TEMP_REG1, uintptr_t(&m_near.top_sp));
-	la_ld_d(&a, LA_SP, TEMP_REG1, 0);
+	la_move(&a, LA_SP, TOP_SP_REG);
 
 	for (int reg = 0; reg < 8; reg++)
 		la_fld_d(&a, la_fpr_t(LA_FS0 + reg), LA_SP, TOP_FRAME_FS0 + (8 * reg));
 	for (int reg = 8; reg >= 0; reg--)
 		la_ld_d(&a, la_gpr_t(LA_S0 + reg), LA_SP, TOP_FRAME_S0 + (8 * reg));
+	la_ld_d(&a, TOP_SP_REG, LA_SP, TOP_FRAME_TOP_SP);
 	la_ld_d(&a, LA_RA, LA_SP, TOP_FRAME_RA);
 	la_ld_d(&a, LA_FP, LA_SP, TOP_FRAME_FP);
 	la_addi_d(&a, LA_SP, LA_SP, TOP_FRAME_SIZE);
@@ -2376,8 +2383,7 @@ void drcbe_la64::op_recover(lagoon_assembler_t &a, const uml::instruction &inst)
 
 	emit_sync_fcsr(a);
 
-	load_address(a, TEMP_REG1, uintptr_t(&m_near.top_sp));
-	la_ld_d(&a, REG_PARAM2, TEMP_REG1, 0);
+	la_move(&a, REG_PARAM2, TOP_SP_REG);
 	// the first generated-code subroutine frame sits below the top-level frame;
 	// its return address is the outermost call site
 	la_ld_d(&a, REG_PARAM2, REG_PARAM2, -(HANDLE_FRAME_SIZE + 8));
