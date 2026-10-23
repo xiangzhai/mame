@@ -670,7 +670,7 @@ drc_specifictest: PASS (8 dword + 32 byte + 16 word reads, 8 dword + 8 narrow wr
 | flag 子集计算 | 已实现 | `emit_flags_nz/add/sub` 接受 `inst.flags()` 掩码，只计算请求的 Z/S/C/V；未请求的标志位保持不变，CFG 活性仍用于 CMP/TEST 融合 |
 | FTOINT/FCMP | 已实现 | `ROUND_DEFAULT` 直接用 FCSR 隐式舍入的 `ftint`；FCMP 去掉选择分支，并按 `inst.flags()` 只搬运需要的 C/Z/U |
 | indexed LOAD/STORE | 已实现 | 使用 `ldx/stx` 去掉 base+index 的额外 `add`；目标寄存器仍经 `TEMP_REG3` 中转 |
-| 固定生成缓冲区 | 未实现 | 仍按 `1024 B/指令` 预留，超出 `block.abort()`；asmjit 后端可增长/重试 |
+| 可增长生成缓冲区 | 已实现 | lagoon 支持按需 `realloc` 的可增长缓冲区，并以最终执行地址为虚拟基址处理 PC 相对/局部标签重定位；后端生成后按精确大小分配 DRC cache 并拷贝，不再按 `1024 B/指令` 预留 |
 
 #### 9.6.1 已实现的立即数/位域路径
 
@@ -691,7 +691,12 @@ drc_specifictest: PASS (8 dword + 32 byte + 16 word reads, 8 dword + 8 narrow wr
 - FTOINT 的 `ROUND_DEFAULT` 不再展开 4 个舍入分支，而是直接使用按 FCSR 当前舍入模式执行的 `ftint.w/l`；源浮点寄存器和整数目标也通过 `select_register()` 直连。
 - FCMP 仍发 3 条比较以保持 NaN/异常语义，但去掉有序/无序选择分支，直接把 C/Z/U 移入所需位，并按 `inst.flags()` 省略未请求的 `movcf2gr`。
 
-#### 9.6.4 仍保留的差距
+#### 9.6.4 可增长生成缓冲区
+
+- `lagoon_assembler_t` 分离了存储缓冲区与虚拟执行地址：`buffer` 可随指令增长重新分配，`base_address` 始终指向最终 DRC cache 中的地址。标签仍保存相对偏移，`la.local/global` 与分支回填都基于虚拟地址重新计算，因此缓冲区搬移不需要搬运或修补已存标签。
+- 后端首先生成到可增长缓冲区，检查 `la_has_error()` 后按精确 `la_get_code_size()` 从 `drc_cache` 分配空间，再拷贝到预测的最终地址并刷新指令缓存。这样只在块实际大于剩余缓存时才失败，不再因为固定预留估算而提前 `block.abort()`。
+- 临时缓冲区使用 RAII guard 释放，异常或分配失败路径也不会泄漏。
+
+#### 9.6.5 仍保留的差距
 
 - 条件移动没有改用 `maskeqz/masknez`，原因见上表：LoongArch 缺少单条 csel/cmov，3 条 mask/or 序列在多数情况下不优于可预测的分支。
-- 固定生成缓冲区仍按 `1024 B/指令` 预留，超出时 `block.abort()`。

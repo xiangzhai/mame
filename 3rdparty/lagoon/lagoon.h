@@ -275,12 +275,21 @@ typedef struct {
 } lagoon_label_t;
 
 typedef struct {
-    uint8_t* buffer;
-    uint8_t* cursor;
+    uint8_t* buffer;        /* growable storage */
+    uint8_t* cursor;        /* virtual address, i.e. base_address + offset */
+    uintptr_t base_address; /* address the code will execute from */
     size_t capacity;
+    bool growable;
+    bool owns_buffer;
+    bool error;
 } lagoon_assembler_t;
 
 void la_init_assembler(lagoon_assembler_t* assembler, uint8_t* buffer, size_t capacity);
+void la_init_growable_assembler(lagoon_assembler_t* assembler, uintptr_t base_address, size_t initial_capacity);
+void la_free_assembler(lagoon_assembler_t* assembler);
+size_t la_get_code_size(lagoon_assembler_t const* assembler);
+uint8_t* la_get_code_buffer(lagoon_assembler_t const* assembler);
+bool la_has_error(lagoon_assembler_t const* assembler);
 size_t la_get_remaining_buffer_size(lagoon_assembler_t* assembler);
 void la_bind(lagoon_assembler_t* assembler, lagoon_label_t* label);
 ptrdiff_t la_label(lagoon_assembler_t* assembler, lagoon_label_t* label);

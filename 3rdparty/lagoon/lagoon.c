@@ -4,10 +4,58 @@
 
 #include "lagoon.h"
 
+static size_t la_code_offset(lagoon_assembler_t const* assembler)
+{
+    return (size_t)((uintptr_t)assembler->cursor - assembler->base_address);
+}
+
+static bool la_reserve(lagoon_assembler_t* assembler, size_t extra)
+{
+    if (assembler->error)
+        return false;
+
+    size_t const offset = la_code_offset(assembler);
+    if (offset > assembler->capacity) {
+        assembler->error = true;
+        return false;
+    }
+    if (extra <= (assembler->capacity - offset))
+        return true;
+
+    if (!assembler->growable) {
+        assembler->error = true;
+        return false;
+    }
+
+    size_t const needed = offset + extra;
+    size_t new_capacity = assembler->capacity ? assembler->capacity : 64;
+    while (new_capacity < needed) {
+        if (new_capacity > (SIZE_MAX / 2)) {
+            new_capacity = needed;
+            break;
+        }
+        new_capacity *= 2;
+    }
+
+    uint8_t* new_buffer = (uint8_t*)realloc(assembler->buffer, new_capacity);
+    if (!new_buffer) {
+        assembler->error = true;
+        return false;
+    }
+
+    assembler->buffer = new_buffer;
+    assembler->capacity = new_capacity;
+    return true;
+}
+
 static void emit32(lagoon_assembler_t* assembler, uint32_t instruction)
 {
-    *((uint32_t*)(assembler->cursor)) = instruction;
-    assembler->cursor += 4;
+    if (!la_reserve(assembler, sizeof(instruction)))
+        return;
+
+    size_t const offset = la_code_offset(assembler);
+    *((uint32_t*)(assembler->buffer + offset)) = instruction;
+    assembler->cursor += sizeof(instruction);
 }
 
 static int32_t la_sign_extend(uint64_t value, unsigned bits)
@@ -48,7 +96,7 @@ static int patch_la_local(lagoon_assembler_t* assembler, uint8_t* patch_location
 
     if ((pcalau12i & 0xfe000000) != 0x1a000000)
         return 0;
-    if (patch_location + 8 > assembler->cursor)
+    if (patch_location + 8 > assembler->buffer + la_code_offset(assembler))
         return 0;
 
     addi_d = *((uint32_t*)(patch_location + 4));
@@ -58,8 +106,8 @@ static int patch_la_local(lagoon_assembler_t* assembler, uint8_t* patch_location
     if ((addi_d & 0xffc00000) != 0x02c00000 || addi_d_rd != pcalau12i_rd || addi_d_rj != pcalau12i_rd)
         return 0;
 
-    pc = (uintptr_t)patch_location;
-    target = (uintptr_t)(assembler->buffer + label_location);
+    pc = assembler->base_address + (uintptr_t)(patch_location - assembler->buffer);
+    target = assembler->base_address + (uintptr_t)label_location;
     hi20 = la_pcala_hi20(target, pc);
     lo12 = la_pcala_lo12(target);
     LA_ASSERT_SIGNED_RANGE(hi20, 20);
@@ -86,7 +134,7 @@ static int patch_la_global(lagoon_assembler_t* assembler, uint8_t* patch_locatio
 
     if ((pcalau12i & 0xfe000000) != 0x1a000000)
         return 0;
-    if (patch_location + 8 > assembler->cursor)
+    if (patch_location + 8 > assembler->buffer + la_code_offset(assembler))
         return 0;
 
     ld_d = *((uint32_t*)(patch_location + 4));
@@ -96,8 +144,8 @@ static int patch_la_global(lagoon_assembler_t* assembler, uint8_t* patch_locatio
     if ((ld_d & 0xffc00000) != 0x28c00000 || ld_d_rd != pcalau12i_rd || ld_d_rj != pcalau12i_rd)
         return 0;
 
-    pc = (uintptr_t)patch_location;
-    target = (uintptr_t)(assembler->buffer + label_location);
+    pc = assembler->base_address + (uintptr_t)(patch_location - assembler->buffer);
+    target = assembler->base_address + (uintptr_t)label_location;
     hi20 = la_pcala_hi20(target, pc);
     lo12 = la_pcala_lo12(target);
     LA_ASSERT_SIGNED_RANGE(hi20, 20);
@@ -113,19 +161,69 @@ static int patch_la_global(lagoon_assembler_t* assembler, uint8_t* patch_locatio
 void la_init_assembler(lagoon_assembler_t* assembler, uint8_t* buffer, size_t capacity)
 {
     assembler->buffer = buffer;
-    assembler->capacity = capacity;
     assembler->cursor = buffer;
+    assembler->base_address = (uintptr_t)buffer;
+    assembler->capacity = capacity;
+    assembler->growable = false;
+    assembler->owns_buffer = false;
+    assembler->error = (buffer == NULL);
+}
+
+void la_init_growable_assembler(lagoon_assembler_t* assembler, uintptr_t base_address, size_t initial_capacity)
+{
+    if (initial_capacity < 64)
+        initial_capacity = 64;
+
+    assembler->buffer = (uint8_t*)malloc(initial_capacity);
+    assembler->cursor = (uint8_t*)base_address;
+    assembler->base_address = base_address;
+    assembler->capacity = assembler->buffer ? initial_capacity : 0;
+    assembler->growable = true;
+    assembler->owns_buffer = true;
+    assembler->error = (assembler->buffer == NULL);
+}
+
+void la_free_assembler(lagoon_assembler_t* assembler)
+{
+    if (assembler->owns_buffer)
+        free(assembler->buffer);
+
+    assembler->buffer = NULL;
+    assembler->cursor = NULL;
+    assembler->base_address = 0;
+    assembler->capacity = 0;
+    assembler->growable = false;
+    assembler->owns_buffer = false;
+    assembler->error = false;
+}
+
+size_t la_get_code_size(lagoon_assembler_t const* assembler)
+{
+    return la_code_offset(assembler);
+}
+
+uint8_t* la_get_code_buffer(lagoon_assembler_t const* assembler)
+{
+    return assembler->buffer;
+}
+
+bool la_has_error(lagoon_assembler_t const* assembler)
+{
+    return assembler->error;
 }
 
 size_t la_get_remaining_buffer_size(lagoon_assembler_t* assembler)
 {
-    return assembler->capacity - (size_t)(assembler->cursor - assembler->buffer);
+    return assembler->capacity - la_code_offset(assembler);
 }
 
 void la_emit_bytes(lagoon_assembler_t* assembler, const void* bytes, size_t size)
 {
+    if (!la_reserve(assembler, size))
+        return;
+
     if (size != 0)
-        memcpy(assembler->cursor, bytes, size);
+        memcpy(assembler->buffer + la_code_offset(assembler), bytes, size);
     assembler->cursor += size;
 }
 
@@ -156,7 +254,7 @@ void la_emit_ptr(lagoon_assembler_t* assembler, uintptr_t value)
 
 void la_bind(lagoon_assembler_t* assembler, lagoon_label_t* label)
 {
-    label->location = (ptrdiff_t)(assembler->cursor - assembler->buffer);
+    label->location = (ptrdiff_t)la_code_offset(assembler);
     label->is_bound = 1;
 
     // backpatch
@@ -223,7 +321,7 @@ void la_bind(lagoon_assembler_t* assembler, lagoon_label_t* label)
 ptrdiff_t la_label(lagoon_assembler_t* assembler, lagoon_label_t* label)
 {
     if (label->is_bound) {
-        ptrdiff_t result = (label->location - (ptrdiff_t)(assembler->cursor - assembler->buffer));
+        ptrdiff_t result = (label->location - (ptrdiff_t)la_code_offset(assembler));
         return result;
     }
 
@@ -246,7 +344,7 @@ ptrdiff_t la_label(lagoon_assembler_t* assembler, lagoon_label_t* label)
         label->offset_capacity = new_capacity;
     }
 
-    ptrdiff_t offset = (ptrdiff_t)(assembler->cursor - assembler->buffer);
+    ptrdiff_t offset = (ptrdiff_t)la_code_offset(assembler);
     label->offsets[label->offset_count++] = offset;
     return 0;
 }
