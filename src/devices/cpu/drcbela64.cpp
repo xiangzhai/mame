@@ -264,6 +264,42 @@ inline uint8_t compute_sub_flags(uint64_t a, uint64_t b, uint32_t size)
 	return flags;
 }
 
+inline bool is_simm12(int64_t value)
+{
+	return (value >= -2048) && (value <= 2047);
+}
+
+inline uint64_t sign_extend12(uint64_t value)
+{
+	uint64_t const shifted = (value & 0xfff) << 52;
+	return uint64_t(int64_t(shifted) >> 52);
+}
+
+// true if a 12-bit signed logical immediate can represent value at the
+// requested operand size
+inline bool is_logic_imm12(uint64_t value, uint32_t size)
+{
+	uint64_t const extended = sign_extend12(value);
+	return (size == 4) ? (uint32_t(value) == uint32_t(extended)) : (value == extended);
+}
+
+inline uint64_t size_mask(uint32_t size)
+{
+	return (size == 8) ? ~uint64_t(0) : ((uint64_t(1) << (size * 8)) - 1);
+}
+
+inline bool is_contiguous_mask(uint64_t mask, uint32_t size)
+{
+	mask &= size_mask(size);
+	if (!mask)
+		return false;
+
+	unsigned const lsb = std::countr_zero(mask);
+	unsigned const width = std::popcount(mask);
+	uint64_t const field = mask >> lsb;
+	return field == ((width == 64) ? ~uint64_t(0) : ((uint64_t(1) << width) - 1));
+}
+
 inline uint8_t compute_nz_flags(uint64_t value, uint32_t size)
 {
 	if (size == 4)
@@ -364,6 +400,10 @@ private:
 	struct near_state
 	{
 		uint64_t saved_fcsr;
+		float single1;
+		double double1;
+		uint8_t nominal_fmod;
+		uint8_t fmod_changed;
 	};
 
 	struct memory_accessors
@@ -414,9 +454,22 @@ private:
 	bool emit_test_branch(lagoon_assembler_t &a, uml::condition_t cond, const be_parameter &src1p, const be_parameter &src2p, uint32_t size, lagoon_label_t &target);
 
 	void emit_memaccess_setup(lagoon_assembler_t &a, const be_parameter &addrp, const memory_accessors &accessors, const address_space::specific_access_info::side &side) const;
+	void emit_narrow_memaccess_setup(lagoon_assembler_t &a, const be_parameter &addrp, const parameter &spacesizep, const memory_accessors &accessors, const address_space::specific_access_info::side &side) const;
+	void emit_narrow_memread(lagoon_assembler_t &a, const be_parameter &addrp, const parameter &spacesizep, const memory_accessors &accessors) const;
+	void emit_narrow_memwrite(lagoon_assembler_t &a, const be_parameter &addrp, const parameter &spacesizep, const memory_accessors &accessors) const;
 	void emit_specific_call(lagoon_assembler_t &a, const address_space::specific_access_info::side &side) const;
 	void emit_sync_fcsr(lagoon_assembler_t &a) const;
+	void emit_fcsr_sync_if_changed(lagoon_assembler_t &a) const;
 	void call_helper_addr(lagoon_assembler_t &a, uintptr_t addr) const;
+
+	bool state_offset(const void *ptr, int32_t &offset) const;
+	void emit_ldr_state_b(lagoon_assembler_t &a, la_gpr_t reg, const void *ptr) const;
+	void emit_ldr_state_w(lagoon_assembler_t &a, la_gpr_t reg, const void *ptr) const;
+	void emit_ldr_state_d(lagoon_assembler_t &a, la_gpr_t reg, const void *ptr) const;
+	void emit_float_ldr_state(lagoon_assembler_t &a, la_fpr_t reg, const void *ptr, int size) const;
+	void emit_str_state_b(lagoon_assembler_t &a, la_gpr_t reg, const void *ptr) const;
+	void emit_str_state_w(lagoon_assembler_t &a, la_gpr_t reg, const void *ptr) const;
+	void emit_str_state_d(lagoon_assembler_t &a, la_gpr_t reg, const void *ptr) const;
 
 	void emit_flags_nz(lagoon_assembler_t &a, la_gpr_t reg, int bits, la_gpr_t output);
 	void emit_flags_add(lagoon_assembler_t &a, la_gpr_t result, la_gpr_t src1, la_gpr_t src2, int bits, bool carryin);
@@ -430,6 +483,7 @@ private:
 
 	void mov_reg_param(lagoon_assembler_t &a, uint32_t regsize, la_gpr_t dst, const be_parameter &src) const;
 	void mov_param_reg(lagoon_assembler_t &a, uint32_t regsize, const be_parameter &dst, la_gpr_t src) const;
+	void write_result(lagoon_assembler_t &a, uint32_t regsize, const be_parameter &dst, la_gpr_t result, bool already_extended = false) const;
 	void mov_param_imm(lagoon_assembler_t &a, uint32_t regsize, const be_parameter &dst, uint64_t src) const;
 	void mov_param_param(lagoon_assembler_t &a, uint32_t regsize, const be_parameter &dst, const be_parameter &src) const;
 	void mov_mem_param(lagoon_assembler_t &a, uint32_t regsize, void *dst, const be_parameter &src) const;
@@ -788,6 +842,121 @@ void drcbe_la64::emit_strh_mem(lagoon_assembler_t &a, la_gpr_t reg, const void *
 	la_st_h(&a, reg, addr, 0);
 }
 
+bool drcbe_la64::state_offset(const void *ptr, int32_t &offset) const
+{
+	int64_t const diff = int64_t(uintptr_t(ptr)) - int64_t(uintptr_t(m_baseptr));
+	if ((diff < -2048) || (diff > 2047))
+		return false;
+	offset = int32_t(diff);
+	return true;
+}
+
+void drcbe_la64::emit_ldr_state_b(lagoon_assembler_t &a, la_gpr_t reg, const void *ptr) const
+{
+	int32_t offset;
+	if (state_offset(ptr, offset))
+	{
+		la_ld_bu(&a, reg, BASE_REG, offset);
+	}
+	else
+	{
+		la_gpr_t const addr = (reg == MEM_SCRATCH_REG) ? SCRATCH_REG1 : MEM_SCRATCH_REG;
+		load_address(a, addr, uintptr_t(ptr));
+		la_ld_bu(&a, reg, addr, 0);
+	}
+}
+
+void drcbe_la64::emit_ldr_state_w(lagoon_assembler_t &a, la_gpr_t reg, const void *ptr) const
+{
+	int32_t offset;
+	if (state_offset(ptr, offset))
+	{
+		la_ld_wu(&a, reg, BASE_REG, offset);
+	}
+	else
+	{
+		la_gpr_t const addr = (reg == MEM_SCRATCH_REG) ? SCRATCH_REG1 : MEM_SCRATCH_REG;
+		load_address(a, addr, uintptr_t(ptr));
+		la_ld_wu(&a, reg, addr, 0);
+	}
+}
+
+void drcbe_la64::emit_ldr_state_d(lagoon_assembler_t &a, la_gpr_t reg, const void *ptr) const
+{
+	int32_t offset;
+	if (state_offset(ptr, offset))
+	{
+		la_ld_d(&a, reg, BASE_REG, offset);
+	}
+	else
+	{
+		la_gpr_t const addr = (reg == MEM_SCRATCH_REG) ? SCRATCH_REG1 : MEM_SCRATCH_REG;
+		load_address(a, addr, uintptr_t(ptr));
+		la_ld_d(&a, reg, addr, 0);
+	}
+}
+
+void drcbe_la64::emit_str_state_b(lagoon_assembler_t &a, la_gpr_t reg, const void *ptr) const
+{
+	int32_t offset;
+	if (state_offset(ptr, offset))
+	{
+		la_st_b(&a, reg, BASE_REG, offset);
+	}
+	else
+	{
+		la_gpr_t const addr = (reg == MEM_SCRATCH_REG) ? SCRATCH_REG1 : MEM_SCRATCH_REG;
+		load_address(a, addr, uintptr_t(ptr));
+		la_st_b(&a, reg, addr, 0);
+	}
+}
+
+void drcbe_la64::emit_str_state_w(lagoon_assembler_t &a, la_gpr_t reg, const void *ptr) const
+{
+	int32_t offset;
+	if (state_offset(ptr, offset))
+	{
+		la_st_w(&a, reg, BASE_REG, offset);
+	}
+	else
+	{
+		la_gpr_t const addr = (reg == MEM_SCRATCH_REG) ? SCRATCH_REG1 : MEM_SCRATCH_REG;
+		load_address(a, addr, uintptr_t(ptr));
+		la_st_w(&a, reg, addr, 0);
+	}
+}
+
+void drcbe_la64::emit_str_state_d(lagoon_assembler_t &a, la_gpr_t reg, const void *ptr) const
+{
+	int32_t offset;
+	if (state_offset(ptr, offset))
+	{
+		la_st_d(&a, reg, BASE_REG, offset);
+	}
+	else
+	{
+		la_gpr_t const addr = (reg == MEM_SCRATCH_REG) ? SCRATCH_REG1 : MEM_SCRATCH_REG;
+		load_address(a, addr, uintptr_t(ptr));
+		la_st_d(&a, reg, addr, 0);
+	}
+}
+
+void drcbe_la64::emit_float_ldr_state(lagoon_assembler_t &a, la_fpr_t reg, const void *ptr, int size) const
+{
+	int32_t offset;
+	if (state_offset(ptr, offset))
+	{
+		if (size == 4)
+			la_fld_s(&a, reg, BASE_REG, offset);
+		else
+			la_fld_d(&a, reg, BASE_REG, offset);
+	}
+	else
+	{
+		emit_float_ldr_mem(a, reg, ptr, size);
+	}
+}
+
 void drcbe_la64::emit_float_ldr_mem(lagoon_assembler_t &a, la_fpr_t reg, const void *ptr, int size) const
 {
 	la_gpr_t const addr = MEM_SCRATCH_REG;
@@ -1081,14 +1250,24 @@ void drcbe_la64::merge_flags(lagoon_assembler_t &a, uint8_t mask)
 
 void drcbe_la64::emit_sync_fcsr(lagoon_assembler_t &a) const
 {
-	load_address(a, TEMP_REG1, uintptr_t(&m_state.fmod));
-	la_ld_bu(&a, TEMP_REG2, TEMP_REG1, 0);
+	emit_ldr_state_b(a, TEMP_REG2, &m_state.fmod);
 	la_andi(&a, TEMP_REG2, TEMP_REG2, 3);
 	la_xori(&a, TEMP_REG2, TEMP_REG2, 1);
 	la_slli_d(&a, TEMP_REG2, TEMP_REG2, 8);
 	la_movfcsr2gr(&a, TEMP_REG1, LA_FCSR0);
 	la_bstrins_d(&a, TEMP_REG1, TEMP_REG2, 9, 8);
 	la_movgr2fcsr(&a, LA_FCSR0, TEMP_REG1);
+}
+
+void drcbe_la64::emit_fcsr_sync_if_changed(lagoon_assembler_t &a) const
+{
+	// branch over just the FCSR write; the caller's operation must still run
+	lagoon_label_t skip = {};
+	emit_ldr_state_b(a, FLAGS_REG, &m_near.fmod_changed);
+	la_beqz(&a, FLAGS_REG, la_label(&a, &skip));
+	emit_sync_fcsr(a);
+	la_bind(&a, &skip);
+	la_label_free(&a, &skip);
 }
 
 void drcbe_la64::call_helper_addr(lagoon_assembler_t &a, uintptr_t addr) const
@@ -1112,7 +1291,12 @@ void drcbe_la64::mov_reg_param(lagoon_assembler_t &a, uint32_t regsize, la_gpr_t
 	}
 	else if (src.is_int_register())
 	{
-		la_move(&a, dst, src.get_register_int(regsize));
+		la_gpr_t const srcreg = src.get_register_int(regsize);
+		if (dst != srcreg)
+			la_move(&a, dst, srcreg);
+
+		// the source may still hold a 64-bit value, so a 32-bit read has
+		// to truncate even when source and destination are the same
 		if (regsize == 4)
 			zero_extend32(a, dst);
 	}
@@ -1159,9 +1343,27 @@ void drcbe_la64::mov_param_reg(lagoon_assembler_t &a, uint32_t regsize, const be
 	}
 	else if (dst.is_int_register())
 	{
-		la_move(&a, dst.get_register_int(regsize), src);
+		la_gpr_t const dstreg = dst.get_register_int(regsize);
+		if (dstreg != src)
+			la_move(&a, dstreg, src);
 		if (regsize == 4)
-			zero_extend32(a, dst.get_register_int(regsize));
+			zero_extend32(a, dstreg);
+	}
+}
+
+void drcbe_la64::write_result(lagoon_assembler_t &a, uint32_t regsize, const be_parameter &dst, la_gpr_t result, bool already_extended) const
+{
+	if (dst.is_int_register())
+	{
+		la_gpr_t const dstreg = dst.get_register_int(regsize);
+		if ((regsize == 4) && !already_extended)
+			zero_extend32(a, result);
+		if (dstreg != result)
+			la_move(&a, dstreg, result);
+	}
+	else
+	{
+		mov_param_reg(a, regsize, dst, result);
 	}
 }
 
@@ -1368,6 +1570,136 @@ void drcbe_la64::emit_memaccess_setup(lagoon_assembler_t &a, const be_parameter 
 	}
 }
 
+void drcbe_la64::emit_narrow_memaccess_setup(lagoon_assembler_t &a, const be_parameter &addrp, const parameter &spacesizep, const memory_accessors &accessors, const address_space::specific_access_info::side &side) const
+{
+	address_space &space = *m_space[spacesizep.space()];
+	la_gpr_t const addrreg = (accessors.no_mask || accessors.mask_simple) ? REG_PARAM2 : FUNC_SCRATCH_REG;
+	mov_reg_param(a, 4, addrreg, addrp);
+	load_address(a, MEM_SCRATCH_REG, uintptr_t(side.dispatch));
+
+	// compute the data/shift offset within the native word
+	int const shift = space.addr_shift() - 3;
+	uint32_t const shiftmask = (accessors.specific.native_bytes - (1 << spacesizep.size())) << 3;
+	if (space.endianness() != ENDIANNESS_LITTLE)
+	{
+		bool const smallshift = (shift <= 0) && (shift >= -3);
+		if (!smallshift)
+		{
+			if (shift < 0)
+				la_slli_w(&a, SCRATCH_REG1, addrreg, -shift);
+			else
+				la_srli_w(&a, SCRATCH_REG1, addrreg, shift);
+		}
+		load_imm32(a, FLAGS_REG, shiftmask);
+		if (smallshift)
+		{
+			if (shift < 0)
+			{
+				la_slli_d(&a, SCRATCH_REG2, addrreg, -shift);
+				la_andn(&a, FLAGS_REG, FLAGS_REG, SCRATCH_REG2);
+			}
+			else
+			{
+				la_andn(&a, FLAGS_REG, FLAGS_REG, addrreg);
+			}
+		}
+		else
+		{
+			la_andn(&a, FLAGS_REG, FLAGS_REG, SCRATCH_REG1);
+		}
+	}
+	else
+	{
+		if (shift == 0)
+		{
+			la_andi(&a, FLAGS_REG, addrreg, int32_t(shiftmask));
+		}
+		else
+		{
+			if (shift < 0)
+				la_slli_w(&a, FLAGS_REG, addrreg, -shift);
+			else
+				la_srli_w(&a, FLAGS_REG, addrreg, shift);
+			la_andi(&a, FLAGS_REG, FLAGS_REG, int32_t(shiftmask));
+		}
+	}
+
+	// if the high bits aren't affected by the global mask, extract them early
+	if (accessors.high_bits && !accessors.mask_high_bits)
+		la_bstrpick_d(&a, SCRATCH_REG1, addrreg, accessors.specific.low_bits + accessors.high_bits - 1, accessors.specific.low_bits);
+
+	if (!accessors.no_mask)
+	{
+		if (accessors.mask_simple && (accessors.address_mask < 0x1000))
+		{
+			la_andi(&a, REG_PARAM2, addrreg, uint32_t(accessors.address_mask));
+		}
+		else
+		{
+			load_imm64(a, SCRATCH_REG2, accessors.address_mask);
+			la_and(&a, REG_PARAM2, addrreg, SCRATCH_REG2);
+		}
+	}
+
+	// if the high address bits aren't affected by the global mask, load the dispatch entry now
+	if (!accessors.high_bits)
+	{
+		la_ld_d(&a, REG_PARAM1, MEM_SCRATCH_REG, 0);
+	}
+	else if (!accessors.mask_high_bits)
+	{
+		la_slli_d(&a, SCRATCH_REG1, SCRATCH_REG1, 3);
+		la_add_d(&a, MEM_SCRATCH_REG, MEM_SCRATCH_REG, SCRATCH_REG1);
+		la_ld_d(&a, REG_PARAM1, MEM_SCRATCH_REG, 0);
+	}
+	else
+	{
+		la_srli_d(&a, SCRATCH_REG1, REG_PARAM2, accessors.specific.low_bits);
+		la_slli_d(&a, SCRATCH_REG1, SCRATCH_REG1, 3);
+		la_add_d(&a, MEM_SCRATCH_REG, MEM_SCRATCH_REG, SCRATCH_REG1);
+		la_ld_d(&a, REG_PARAM1, MEM_SCRATCH_REG, 0);
+	}
+
+	if (side.displacement)
+	{
+		if ((side.displacement >= -2048) && (side.displacement <= 2047))
+			la_addi_d(&a, REG_PARAM1, REG_PARAM1, int32_t(side.displacement));
+		else
+		{
+			load_imm64(a, SCRATCH_REG1, uint64_t(side.displacement));
+			la_add_d(&a, REG_PARAM1, REG_PARAM1, SCRATCH_REG1);
+		}
+	}
+}
+
+void drcbe_la64::emit_narrow_memread(lagoon_assembler_t &a, const be_parameter &addrp, const parameter &spacesizep, const memory_accessors &accessors) const
+{
+	// mask is in REG_PARAM3
+	emit_narrow_memaccess_setup(a, addrp, spacesizep, accessors, accessors.specific.read);
+
+	la_sll_d(&a, REG_PARAM3, REG_PARAM3, FLAGS_REG);
+
+	emit_specific_call(a, accessors.specific.read);
+
+	if (accessors.specific.native_bytes <= 4)
+		la_srl_w(&a, REG_PARAM1, REG_PARAM1, FLAGS_REG);
+	else
+		la_srl_d(&a, REG_PARAM1, REG_PARAM1, FLAGS_REG);
+
+	la_move(&a, FLAGS_REG, LA_ZERO);
+}
+
+void drcbe_la64::emit_narrow_memwrite(lagoon_assembler_t &a, const be_parameter &addrp, const parameter &spacesizep, const memory_accessors &accessors) const
+{
+	// data is in REG_PARAM3 and mask is in REG_PARAM4
+	emit_narrow_memaccess_setup(a, addrp, spacesizep, accessors, accessors.specific.write);
+
+	la_sll_d(&a, REG_PARAM3, REG_PARAM3, FLAGS_REG);
+	la_sll_d(&a, REG_PARAM4, REG_PARAM4, FLAGS_REG);
+
+	emit_specific_call(a, accessors.specific.write);
+}
+
 void drcbe_la64::emit_specific_call(lagoon_assembler_t &a, const address_space::specific_access_info::side &side) const
 {
 	if (side.is_virtual)
@@ -1404,6 +1736,8 @@ drcbe_la64::drcbe_la64(drcuml_state &drcuml, device_t &device, drc_cache &cache,
 	, m_near(*cache.alloc_near<near_state>())
 {
 	memset(&m_near, 0, sizeof(m_near));
+	m_near.single1 = 1.0F;
+	m_near.double1 = 1.0;
 
 	if (device.machine().options().drc_log_native())
 	{
@@ -1493,10 +1827,20 @@ void drcbe_la64::emit_invariant_code(lagoon_assembler_t &a, uint8_t *dst)
 
 	// save the incoming FCSR and establish the initial rounding mode
 	la_movfcsr2gr(&a, TEMP_REG1, LA_FCSR0);
-	load_address(a, TEMP_REG2, uintptr_t(&m_near.saved_fcsr));
-	la_st_d(&a, TEMP_REG1, TEMP_REG2, 0);
-
 	load_imm64(a, BASE_REG, uintptr_t(m_baseptr));
+	emit_str_state_d(a, TEMP_REG1, &m_near.saved_fcsr);
+
+	// remember the host's nominal rounding mode for helper calls
+	la_srli_d(&a, TEMP_REG2, TEMP_REG1, 8);
+	la_andi(&a, TEMP_REG2, TEMP_REG2, 3);
+	la_xori(&a, TEMP_REG2, TEMP_REG2, 1);
+	emit_str_state_b(a, TEMP_REG2, &m_near.nominal_fmod);
+
+	emit_ldr_state_b(a, TEMP_REG3, &m_state.fmod);
+	la_xor(&a, TEMP_REG3, TEMP_REG3, TEMP_REG2);
+	la_sltu(&a, TEMP_REG3, LA_ZERO, TEMP_REG3);
+	emit_str_state_b(a, TEMP_REG3, &m_near.fmod_changed);
+
 	la_move(&a, FLAGS_REG, LA_ZERO);
 	emit_sync_fcsr(a);
 
@@ -1804,11 +2148,11 @@ void drcbe_la64::op_debug(lagoon_assembler_t &a, const uml::instruction &inst)
 		la_andi(&a, TEMP_REG1, TEMP_REG1, DEBUG_FLAG_CALL_HOOK);
 		la_beqz(&a, TEMP_REG1, la_label(&a, &done));
 
-		emit_sync_fcsr(a);
+		emit_fcsr_sync_if_changed(a);
 		load_address(a, REG_PARAM1, m_debug_cpu_instruction_hook.obj);
 		mov_reg_param(a, 4, REG_PARAM2, pcp);
 		call_helper_addr(a, uintptr_t(m_debug_cpu_instruction_hook.func));
-		emit_sync_fcsr(a);
+		emit_fcsr_sync_if_changed(a);
 
 		la_bind(&a, &done);
 		la_label_free(&a, &done);
@@ -2390,10 +2734,10 @@ void drcbe_la64::op_callc(lagoon_assembler_t &a, const uml::instruction &inst)
 	lagoon_label_t skip = {};
 	emit_skip(a, inst.condition(), skip);
 
-	emit_sync_fcsr(a);
+	emit_fcsr_sync_if_changed(a);
 	load_address(a, REG_PARAM1, uintptr_t(paramp.memory()));
 	call_helper_addr(a, uintptr_t(funcp.cfunc()));
-	emit_sync_fcsr(a);
+	emit_fcsr_sync_if_changed(a);
 
 	if (inst.condition() != uml::COND_ALWAYS)
 	{
@@ -2410,7 +2754,7 @@ void drcbe_la64::op_recover(lagoon_assembler_t &a, const uml::instruction &inst)
 
 	be_parameter dstp(*this, inst.param(0), PTYPE_MR);
 
-	emit_sync_fcsr(a);
+	emit_fcsr_sync_if_changed(a);
 
 	la_move(&a, REG_PARAM2, TOP_SP_REG);
 	// the first generated-code subroutine frame sits below the top-level frame;
@@ -2422,7 +2766,7 @@ void drcbe_la64::op_recover(lagoon_assembler_t &a, const uml::instruction &inst)
 	load_imm32(a, REG_PARAM3, inst.param(1).mapvar());
 	call_helper_addr(a, uintptr_t(m_drcmap_get_value.func));
 
-	emit_sync_fcsr(a);
+	emit_fcsr_sync_if_changed(a);
 
 	if (inst.size() == 4)
 		zero_extend32(a, REG_PARAM1);
@@ -2441,10 +2785,23 @@ void drcbe_la64::op_setfmod(lagoon_assembler_t &a, const uml::instruction &inst)
 	mov_reg_param(a, 4, TEMP_REG1, srcp);
 	la_andi(&a, TEMP_REG1, TEMP_REG1, 3);
 
-	load_address(a, TEMP_REG2, uintptr_t(&m_state.fmod));
-	la_st_b(&a, TEMP_REG1, TEMP_REG2, 0);
+	emit_ldr_state_b(a, TEMP_REG2, &m_state.fmod);
+
+	lagoon_label_t done = {};
+	la_beq(&a, TEMP_REG1, TEMP_REG2, la_label(&a, &done));
+
+	emit_str_state_b(a, TEMP_REG1, &m_state.fmod);
+
+	// remember whether the guest differs from the host's nominal mode
+	emit_ldr_state_b(a, TEMP_REG2, &m_near.nominal_fmod);
+	la_xor(&a, TEMP_REG2, TEMP_REG1, TEMP_REG2);
+	la_sltu(&a, TEMP_REG2, LA_ZERO, TEMP_REG2);
+	emit_str_state_b(a, TEMP_REG2, &m_near.fmod_changed);
 
 	emit_sync_fcsr(a);
+
+	la_bind(&a, &done);
+	la_label_free(&a, &done);
 }
 
 void drcbe_la64::op_getfmod(lagoon_assembler_t &a, const uml::instruction &inst)
@@ -2455,8 +2812,7 @@ void drcbe_la64::op_getfmod(lagoon_assembler_t &a, const uml::instruction &inst)
 
 	be_parameter dstp(*this, inst.param(0), PTYPE_MR);
 
-	load_address(a, TEMP_REG1, uintptr_t(&m_state.fmod));
-	la_ld_bu(&a, TEMP_REG1, TEMP_REG1, 0);
+	emit_ldr_state_b(a, TEMP_REG1, &m_state.fmod);
 	mov_param_reg(a, inst.size(), dstp, TEMP_REG1);
 }
 
@@ -2468,8 +2824,7 @@ void drcbe_la64::op_getexp(lagoon_assembler_t &a, const uml::instruction &inst)
 
 	be_parameter dstp(*this, inst.param(0), PTYPE_MR);
 
-	load_address(a, TEMP_REG1, uintptr_t(&m_state.exp));
-	la_ld_wu(&a, TEMP_REG1, TEMP_REG1, 0);
+	emit_ldr_state_w(a, TEMP_REG1, &m_state.exp);
 	mov_param_reg(a, inst.size(), dstp, TEMP_REG1);
 }
 
@@ -2511,12 +2866,10 @@ void drcbe_la64::op_save(lagoon_assembler_t &a, const uml::instruction &inst)
 
 	la_st_b(&a, FLAGS_REG, SCRATCH_REG2, offsetof(drcuml_machine_state, flags));
 
-	load_address(a, SCRATCH_REG1, uintptr_t(&m_state.fmod));
-	la_ld_bu(&a, SCRATCH_REG1, SCRATCH_REG1, 0);
+	emit_ldr_state_b(a, SCRATCH_REG1, &m_state.fmod);
 	la_st_b(&a, SCRATCH_REG1, SCRATCH_REG2, offsetof(drcuml_machine_state, fmod));
 
-	load_address(a, SCRATCH_REG1, uintptr_t(&m_state.exp));
-	la_ld_wu(&a, SCRATCH_REG1, SCRATCH_REG1, 0);
+	emit_ldr_state_w(a, SCRATCH_REG1, &m_state.exp);
 	la_st_w(&a, SCRATCH_REG1, SCRATCH_REG2, offsetof(drcuml_machine_state, exp));
 
 	int regoffs = offsetof(drcuml_machine_state, r);
@@ -2528,8 +2881,7 @@ void drcbe_la64::op_save(lagoon_assembler_t &a, const uml::instruction &inst)
 		}
 		else
 		{
-			load_address(a, SCRATCH_REG1, uintptr_t(&m_state.r[regnum].d));
-			la_ld_d(&a, SCRATCH_REG1, SCRATCH_REG1, 0);
+			emit_ldr_state_d(a, SCRATCH_REG1, &m_state.r[regnum].d);
 			la_st_d(&a, SCRATCH_REG1, SCRATCH_REG2, regoffs + (8 * regnum));
 		}
 	}
@@ -2569,8 +2921,7 @@ void drcbe_la64::op_restore(lagoon_assembler_t &a, const uml::instruction &inst)
 		else
 		{
 			la_ld_d(&a, SCRATCH_REG1, SCRATCH_REG2, regoffs + (8 * regnum));
-			load_address(a, FUNC_SCRATCH_REG, uintptr_t(&m_state.r[regnum].d));
-			la_st_d(&a, SCRATCH_REG1, FUNC_SCRATCH_REG, 0);
+			emit_str_state_d(a, SCRATCH_REG1, &m_state.r[regnum].d);
 		}
 	}
 
@@ -2591,12 +2942,15 @@ void drcbe_la64::op_restore(lagoon_assembler_t &a, const uml::instruction &inst)
 
 	la_ld_bu(&a, TEMP_REG1, SCRATCH_REG2, offsetof(drcuml_machine_state, fmod));
 	la_andi(&a, TEMP_REG1, TEMP_REG1, 3);
-	load_address(a, TEMP_REG2, uintptr_t(&m_state.fmod));
-	la_st_b(&a, TEMP_REG1, TEMP_REG2, 0);
+
+	emit_ldr_state_b(a, TEMP_REG2, &m_near.nominal_fmod);
+	la_xor(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+	la_sltu(&a, TEMP_REG3, LA_ZERO, TEMP_REG3);
+	emit_str_state_b(a, TEMP_REG3, &m_near.fmod_changed);
+	emit_str_state_b(a, TEMP_REG1, &m_state.fmod);
 
 	la_ld_wu(&a, TEMP_REG1, SCRATCH_REG2, offsetof(drcuml_machine_state, exp));
-	load_address(a, TEMP_REG2, uintptr_t(&m_state.exp));
-	la_st_w(&a, TEMP_REG1, TEMP_REG2, 0);
+	emit_str_state_w(a, TEMP_REG1, &m_state.exp);
 
 	la_ld_bu(&a, FLAGS_REG, SCRATCH_REG2, offsetof(drcuml_machine_state, flags));
 	la_andi(&a, FLAGS_REG, FLAGS_REG, uml::FLAGS_ALL);
@@ -2620,18 +2974,6 @@ void drcbe_la64::op_load(lagoon_assembler_t &a, const uml::instruction &inst)
 	const int scale = scalesizep.scale();
 
 	const la_gpr_t dstreg = TEMP_REG3;
-
-	auto emit_load = [&](la_gpr_t base)
-	{
-		if (size == SIZE_BYTE)
-			la_ld_bu(&a, dstreg, base, 0);
-		else if (size == SIZE_WORD)
-			la_ld_hu(&a, dstreg, base, 0);
-		else if (size == SIZE_DWORD)
-			la_ld_wu(&a, dstreg, base, 0);
-		else
-			la_ld_d(&a, dstreg, base, 0);
-	};
 
 	if (indp.is_immediate())
 	{
@@ -2661,8 +3003,14 @@ void drcbe_la64::op_load(lagoon_assembler_t &a, const uml::instruction &inst)
 		sign_extend32(a, TEMP_REG2);
 		if (scale)
 			la_slli_d(&a, TEMP_REG2, TEMP_REG2, scale);
-		la_add_d(&a, TEMP_REG1, TEMP_REG1, TEMP_REG2);
-		emit_load(TEMP_REG1);
+		if (size == SIZE_BYTE)
+			la_ldx_bu(&a, dstreg, TEMP_REG1, TEMP_REG2);
+		else if (size == SIZE_WORD)
+			la_ldx_hu(&a, dstreg, TEMP_REG1, TEMP_REG2);
+		else if (size == SIZE_DWORD)
+			la_ldx_wu(&a, dstreg, TEMP_REG1, TEMP_REG2);
+		else
+			la_ldx_d(&a, dstreg, TEMP_REG1, TEMP_REG2);
 		if ((size == SIZE_QWORD) && (inst.size() == 4))
 			zero_extend32(a, dstreg);
 		else if ((size == SIZE_DWORD) && (inst.size() == 8))
@@ -2687,20 +3035,6 @@ void drcbe_la64::op_loads(lagoon_assembler_t &a, const uml::instruction &inst)
 	const int scale = scalesizep.scale();
 
 	const la_gpr_t dstreg = TEMP_REG3;
-
-	auto emit_load = [&](la_gpr_t base)
-	{
-		if (size == SIZE_BYTE)
-			la_ld_b(&a, dstreg, base, 0);
-		else if (size == SIZE_WORD)
-			la_ld_h(&a, dstreg, base, 0);
-		else if ((size == SIZE_DWORD) && (inst.size() == 8))
-			la_ld_w(&a, dstreg, base, 0);
-		else if (size == SIZE_DWORD)
-			la_ld_w(&a, dstreg, base, 0);
-		else
-			la_ld_d(&a, dstreg, base, 0);
-	};
 
 	if (indp.is_immediate())
 	{
@@ -2730,8 +3064,14 @@ void drcbe_la64::op_loads(lagoon_assembler_t &a, const uml::instruction &inst)
 		sign_extend32(a, TEMP_REG2);
 		if (scale)
 			la_slli_d(&a, TEMP_REG2, TEMP_REG2, scale);
-		la_add_d(&a, TEMP_REG1, TEMP_REG1, TEMP_REG2);
-		emit_load(TEMP_REG1);
+		if (size == SIZE_BYTE)
+			la_ldx_b(&a, dstreg, TEMP_REG1, TEMP_REG2);
+		else if (size == SIZE_WORD)
+			la_ldx_h(&a, dstreg, TEMP_REG1, TEMP_REG2);
+		else if (size == SIZE_DWORD)
+			la_ldx_w(&a, dstreg, TEMP_REG1, TEMP_REG2);
+		else
+			la_ldx_d(&a, dstreg, TEMP_REG1, TEMP_REG2);
 		if ((size == SIZE_DWORD) && (inst.size() == 4))
 			zero_extend32(a, dstreg);
 		else if ((size == SIZE_QWORD) && (inst.size() == 4))
@@ -2755,18 +3095,6 @@ void drcbe_la64::op_store(lagoon_assembler_t &a, const uml::instruction &inst)
 	const int scale = scalesizep.scale();
 
 	const la_gpr_t srcreg = TEMP_REG3;
-
-	auto emit_store = [&](la_gpr_t base)
-	{
-		if (size == SIZE_BYTE)
-			la_st_b(&a, srcreg, base, 0);
-		else if (size == SIZE_WORD)
-			la_st_h(&a, srcreg, base, 0);
-		else if (size == SIZE_DWORD)
-			la_st_w(&a, srcreg, base, 0);
-		else
-			la_st_d(&a, srcreg, base, 0);
-	};
 
 	mov_reg_param(a, inst.size(), srcreg, srcp);
 
@@ -2795,8 +3123,14 @@ void drcbe_la64::op_store(lagoon_assembler_t &a, const uml::instruction &inst)
 		sign_extend32(a, TEMP_REG2);
 		if (scale)
 			la_slli_d(&a, TEMP_REG2, TEMP_REG2, scale);
-		la_add_d(&a, TEMP_REG1, TEMP_REG1, TEMP_REG2);
-		emit_store(TEMP_REG1);
+		if (size == SIZE_BYTE)
+			la_stx_b(&a, srcreg, TEMP_REG1, TEMP_REG2);
+		else if (size == SIZE_WORD)
+			la_stx_h(&a, srcreg, TEMP_REG1, TEMP_REG2);
+		else if (size == SIZE_DWORD)
+			la_stx_w(&a, srcreg, TEMP_REG1, TEMP_REG2);
+		else
+			la_stx_d(&a, srcreg, TEMP_REG1, TEMP_REG2);
 	}
 }
 
@@ -2936,6 +3270,56 @@ void drcbe_la64::op_bfxu(lagoon_assembler_t &a, const uml::instruction &inst)
 	be_parameter widthp(*this, inst.param(3), PTYPE_MRI);
 	const int bits = inst.size() * 8;
 
+	if (shiftp.is_immediate() && widthp.is_immediate())
+	{
+		uint32_t const shift = uint32_t(shiftp.immediate()) & (bits - 1);
+		uint32_t const width = uint32_t(widthp.immediate()) & (bits - 1);
+
+		mov_reg_param(a, inst.size(), TEMP_REG1, srcp);
+
+		if ((shift + width) <= bits)
+		{
+			if (width == 0)
+			{
+				if (inst.size() == 4)
+					la_rotri_w(&a, TEMP_REG3, TEMP_REG1, shift);
+				else
+					la_rotri_d(&a, TEMP_REG3, TEMP_REG1, shift);
+			}
+			else if (inst.size() == 4)
+			{
+				la_bstrpick_w(&a, TEMP_REG3, TEMP_REG1, shift + width - 1, shift);
+			}
+			else
+			{
+				la_bstrpick_d(&a, TEMP_REG3, TEMP_REG1, shift + width - 1, shift);
+			}
+		}
+		else
+		{
+			if (inst.size() == 4)
+			{
+				la_rotri_w(&a, TEMP_REG3, TEMP_REG1, shift);
+				la_bstrpick_w(&a, TEMP_REG3, TEMP_REG3, width - 1, 0);
+			}
+			else
+			{
+				la_rotri_d(&a, TEMP_REG3, TEMP_REG1, shift);
+				la_bstrpick_d(&a, TEMP_REG3, TEMP_REG3, width - 1, 0);
+			}
+		}
+
+		if (inst.size() == 4)
+			zero_extend32(a, TEMP_REG3);
+		write_result(a, inst.size(), dstp, TEMP_REG3, inst.size() == 4);
+		if (inst.flags())
+		{
+			emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
+			merge_flags(a, FLAG_Z | FLAG_S);
+		}
+		return;
+	}
+
 	mov_reg_param(a, inst.size(), TEMP_REG1, srcp);
 	mov_reg_param(a, 4, TEMP_REG2, shiftp);
 	mov_reg_param(a, 4, TEMP_REG3, widthp);
@@ -2958,7 +3342,7 @@ void drcbe_la64::op_bfxu(lagoon_assembler_t &a, const uml::instruction &inst)
 	if (inst.size() == 4)
 		zero_extend32(a, LA_T4);
 
-	mov_param_reg(a, inst.size(), dstp, LA_T4);
+	write_result(a, inst.size(), dstp, LA_T4, inst.size() == 4);
 	if (inst.flags())
 	{
 		emit_flags_nz(a, LA_T4, bits, FLAG_TMP_REG);
@@ -2977,6 +3361,63 @@ void drcbe_la64::op_bfxs(lagoon_assembler_t &a, const uml::instruction &inst)
 	be_parameter shiftp(*this, inst.param(2), PTYPE_MRI);
 	be_parameter widthp(*this, inst.param(3), PTYPE_MRI);
 	const int bits = inst.size() * 8;
+
+	if (shiftp.is_immediate() && widthp.is_immediate())
+	{
+		uint32_t const shift = uint32_t(shiftp.immediate()) & (bits - 1);
+		uint32_t const width = uint32_t(widthp.immediate()) & (bits - 1);
+
+		mov_reg_param(a, inst.size(), TEMP_REG1, srcp);
+
+		if (width == 0)
+		{
+			if (inst.size() == 4)
+				la_rotri_w(&a, TEMP_REG3, TEMP_REG1, shift);
+			else
+				la_rotri_d(&a, TEMP_REG3, TEMP_REG1, shift);
+		}
+		else if ((shift + width) <= bits)
+		{
+			uint32_t const left = bits - (shift + width);
+			uint32_t const right = bits - width;
+			if (inst.size() == 4)
+			{
+				la_slli_w(&a, TEMP_REG3, TEMP_REG1, left);
+				la_srai_w(&a, TEMP_REG3, TEMP_REG3, right);
+			}
+			else
+			{
+				la_slli_d(&a, TEMP_REG3, TEMP_REG1, left);
+				la_srai_d(&a, TEMP_REG3, TEMP_REG3, right);
+			}
+		}
+		else
+		{
+			uint32_t const n = bits - width;
+			if (inst.size() == 4)
+			{
+				la_rotri_w(&a, TEMP_REG3, TEMP_REG1, shift);
+				la_slli_w(&a, TEMP_REG3, TEMP_REG3, n);
+				la_srai_w(&a, TEMP_REG3, TEMP_REG3, n);
+			}
+			else
+			{
+				la_rotri_d(&a, TEMP_REG3, TEMP_REG1, shift);
+				la_slli_d(&a, TEMP_REG3, TEMP_REG3, n);
+				la_srai_d(&a, TEMP_REG3, TEMP_REG3, n);
+			}
+		}
+
+		if (inst.size() == 4)
+			zero_extend32(a, TEMP_REG3);
+		write_result(a, inst.size(), dstp, TEMP_REG3, inst.size() == 4);
+		if (inst.flags())
+		{
+			emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
+			merge_flags(a, FLAG_Z | FLAG_S);
+		}
+		return;
+	}
 
 	mov_reg_param(a, inst.size(), TEMP_REG1, srcp);
 	mov_reg_param(a, 4, TEMP_REG2, shiftp);
@@ -3000,7 +3441,7 @@ void drcbe_la64::op_bfxs(lagoon_assembler_t &a, const uml::instruction &inst)
 	if (inst.size() == 4)
 		zero_extend32(a, LA_T4);
 
-	mov_param_reg(a, inst.size(), dstp, LA_T4);
+	write_result(a, inst.size(), dstp, LA_T4, inst.size() == 4);
 	if (inst.flags())
 	{
 		emit_flags_nz(a, LA_T4, bits, FLAG_TMP_REG);
@@ -3020,6 +3461,72 @@ void drcbe_la64::op_roland(lagoon_assembler_t &a, const uml::instruction &inst)
 	be_parameter maskp(*this, inst.param(3), PTYPE_MRI);
 	const int bits = inst.size() * 8;
 
+	if (shiftp.is_immediate() && maskp.is_immediate())
+	{
+		uint32_t const shift = uint32_t(shiftp.immediate()) & (bits - 1);
+		uint64_t const mask = (inst.size() == 4) ? uint64_t(uint32_t(maskp.immediate())) : maskp.immediate();
+
+		mov_reg_param(a, inst.size(), TEMP_REG1, srcp);
+
+		la_gpr_t result = TEMP_REG1;
+		if (shift != 0)
+		{
+			uint32_t const rotate = (bits - shift) & (bits - 1);
+			if (inst.size() == 4)
+				la_rotri_w(&a, TEMP_REG3, TEMP_REG1, rotate);
+			else
+				la_rotri_d(&a, TEMP_REG3, TEMP_REG1, rotate);
+			result = TEMP_REG3;
+		}
+
+		if (mask == 0)
+		{
+			la_move(&a, TEMP_REG3, LA_ZERO);
+			result = TEMP_REG3;
+		}
+		else if (mask != size_mask(inst.size()))
+		{
+			if (is_logic_imm12(mask, inst.size()))
+			{
+				la_andi(&a, TEMP_REG3, result, int32_t(uint32_t(mask)));
+				result = TEMP_REG3;
+			}
+			else if (is_contiguous_mask(mask, inst.size()))
+			{
+				unsigned const lsb = std::countr_zero(mask);
+				unsigned const width = std::popcount(mask);
+				if (inst.size() == 4)
+					la_bstrpick_w(&a, TEMP_REG3, result, lsb + width - 1, lsb);
+				else
+					la_bstrpick_d(&a, TEMP_REG3, result, lsb + width - 1, lsb);
+				if (lsb)
+				{
+					if (inst.size() == 4)
+						la_slli_w(&a, TEMP_REG3, TEMP_REG3, lsb);
+					else
+						la_slli_d(&a, TEMP_REG3, TEMP_REG3, lsb);
+				}
+				result = TEMP_REG3;
+			}
+			else
+			{
+				mov_reg_param(a, inst.size(), LA_T5, maskp);
+				la_and(&a, TEMP_REG3, result, LA_T5);
+				result = TEMP_REG3;
+			}
+		}
+
+		if (inst.size() == 4)
+			zero_extend32(a, result);
+		write_result(a, inst.size(), dstp, result, inst.size() == 4);
+		if (inst.flags())
+		{
+			emit_flags_nz(a, result, bits, FLAG_TMP_REG);
+			merge_flags(a, FLAG_Z | FLAG_S);
+		}
+		return;
+	}
+
 	mov_reg_param(a, inst.size(), TEMP_REG1, srcp);
 	mov_reg_param(a, 4, TEMP_REG2, shiftp);
 	la_andi(&a, TEMP_REG2, TEMP_REG2, bits - 1);
@@ -3033,7 +3540,7 @@ void drcbe_la64::op_roland(lagoon_assembler_t &a, const uml::instruction &inst)
 	if (inst.size() == 4)
 		zero_extend32(a, LA_T4);
 
-	mov_param_reg(a, inst.size(), dstp, LA_T4);
+	write_result(a, inst.size(), dstp, LA_T4, inst.size() == 4);
 	if (inst.flags())
 	{
 		emit_flags_nz(a, LA_T4, bits, FLAG_TMP_REG);
@@ -3053,6 +3560,68 @@ void drcbe_la64::op_rolins(lagoon_assembler_t &a, const uml::instruction &inst)
 	be_parameter maskp(*this, inst.param(3), PTYPE_MRI);
 	const int bits = inst.size() * 8;
 
+	if (shiftp.is_immediate() && maskp.is_immediate())
+	{
+		uint32_t const shift = uint32_t(shiftp.immediate()) & (bits - 1);
+		uint64_t const mask = (inst.size() == 4) ? uint64_t(uint32_t(maskp.immediate())) : maskp.immediate();
+
+		mov_reg_param(a, inst.size(), TEMP_REG1, dstp);
+		la_gpr_t result = TEMP_REG1;
+
+		if (mask != 0)
+		{
+			mov_reg_param(a, inst.size(), TEMP_REG2, srcp);
+
+			la_gpr_t rotated = TEMP_REG2;
+			if (shift != 0)
+			{
+				uint32_t const rotate = (bits - shift) & (bits - 1);
+				if (inst.size() == 4)
+					la_rotri_w(&a, TEMP_REG3, TEMP_REG2, rotate);
+				else
+					la_rotri_d(&a, TEMP_REG3, TEMP_REG2, rotate);
+				rotated = TEMP_REG3;
+			}
+
+			if (mask == size_mask(inst.size()))
+			{
+				result = rotated;
+			}
+			else if (is_contiguous_mask(mask, inst.size()))
+			{
+				unsigned const lsb = std::countr_zero(mask);
+				unsigned const width = std::popcount(mask);
+				if (inst.size() == 4)
+					la_bstrpick_w(&a, TEMP_REG3, rotated, lsb + width - 1, lsb);
+				else
+					la_bstrpick_d(&a, TEMP_REG3, rotated, lsb + width - 1, lsb);
+				if (inst.size() == 4)
+					la_bstrins_w(&a, TEMP_REG1, TEMP_REG3, lsb + width - 1, lsb);
+				else
+					la_bstrins_d(&a, TEMP_REG1, TEMP_REG3, lsb + width - 1, lsb);
+				result = TEMP_REG1;
+			}
+			else
+			{
+				mov_reg_param(a, inst.size(), LA_T5, maskp);
+				la_and(&a, TEMP_REG3, rotated, LA_T5);
+				la_andn(&a, TEMP_REG1, TEMP_REG1, LA_T5);
+				la_or(&a, TEMP_REG1, TEMP_REG1, TEMP_REG3);
+				result = TEMP_REG1;
+			}
+		}
+
+		if (inst.size() == 4)
+			zero_extend32(a, result);
+		write_result(a, inst.size(), dstp, result, inst.size() == 4);
+		if (inst.flags())
+		{
+			emit_flags_nz(a, result, bits, FLAG_TMP_REG);
+			merge_flags(a, FLAG_Z | FLAG_S);
+		}
+		return;
+	}
+
 	mov_reg_param(a, inst.size(), TEMP_REG1, dstp);
 	mov_reg_param(a, inst.size(), TEMP_REG2, srcp);
 	mov_reg_param(a, 4, TEMP_REG3, shiftp);
@@ -3070,7 +3639,7 @@ void drcbe_la64::op_rolins(lagoon_assembler_t &a, const uml::instruction &inst)
 	if (inst.size() == 4)
 		zero_extend32(a, TEMP_REG1);
 
-	mov_param_reg(a, inst.size(), dstp, TEMP_REG1);
+	write_result(a, inst.size(), dstp, TEMP_REG1, inst.size() == 4);
 	if (inst.flags())
 	{
 		emit_flags_nz(a, TEMP_REG1, bits, FLAG_TMP_REG);
@@ -3088,6 +3657,38 @@ template <bool CarryIn> void drcbe_la64::op_add(lagoon_assembler_t &a, const uml
 	be_parameter src1p(*this, inst.param(1), PTYPE_MRI);
 	be_parameter src2p(*this, inst.param(2), PTYPE_MRI);
 	const int bits = inst.size() * 8;
+
+	if (!CarryIn && !inst.flags())
+	{
+		// addition is commutative; keep the register on the left
+		if (src1p.is_immediate() && !src2p.is_immediate())
+		{
+			using std::swap;
+			swap(src1p, src2p);
+		}
+
+		if (src2p.is_immediate())
+		{
+			int64_t const imm = (inst.size() == 4)
+					? int64_t(int32_t(uint32_t(src2p.immediate())))
+					: int64_t(src2p.immediate());
+			if (is_simm12(imm))
+			{
+				mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
+				la_gpr_t result = TEMP_REG1;
+				if (imm != 0)
+				{
+					if (inst.size() == 4)
+						la_addi_w(&a, TEMP_REG3, TEMP_REG1, int32_t(imm));
+					else
+						la_addi_d(&a, TEMP_REG3, TEMP_REG1, int32_t(imm));
+					result = TEMP_REG3;
+				}
+				write_result(a, inst.size(), dstp, result);
+				return;
+			}
+		}
+	}
 
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
 	mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
@@ -3129,6 +3730,38 @@ template <bool CarryIn> void drcbe_la64::op_sub(lagoon_assembler_t &a, const uml
 	be_parameter src1p(*this, inst.param(1), PTYPE_MRI);
 	be_parameter src2p(*this, inst.param(2), PTYPE_MRI);
 	const int bits = inst.size() * 8;
+
+	if (!CarryIn && !inst.flags())
+	{
+		if (src1p == src2p)
+		{
+			mov_param_imm(a, inst.size(), dstp, 0);
+			return;
+		}
+
+		if (src2p.is_immediate())
+		{
+			int64_t const imm = (inst.size() == 4)
+					? int64_t(int32_t(uint32_t(src2p.immediate())))
+					: int64_t(src2p.immediate());
+			if ((imm >= -2047) && (imm <= 2048))
+			{
+				int64_t const neg = -imm;
+				mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
+				la_gpr_t result = TEMP_REG1;
+				if (neg != 0)
+				{
+					if (inst.size() == 4)
+						la_addi_w(&a, TEMP_REG3, TEMP_REG1, int32_t(neg));
+					else
+						la_addi_d(&a, TEMP_REG3, TEMP_REG1, int32_t(neg));
+					result = TEMP_REG3;
+				}
+				write_result(a, inst.size(), dstp, result);
+				return;
+			}
+		}
+	}
 
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
 	mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
@@ -3214,15 +3847,35 @@ void drcbe_la64::op_and(lagoon_assembler_t &a, const uml::instruction &inst)
 	const int bits = inst.size() * 8;
 
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
-	mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
-	la_and(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-	if (inst.size() == 4)
-		zero_extend32(a, TEMP_REG3);
 
-	mov_param_reg(a, inst.size(), dstp, TEMP_REG3);
+	la_gpr_t result = TEMP_REG3;
+	if (src2p.is_immediate())
+	{
+		uint64_t const imm = (inst.size() == 4) ? uint64_t(uint32_t(src2p.immediate())) : src2p.immediate();
+		if (imm == 0)
+			la_move(&a, TEMP_REG3, LA_ZERO);
+		else if (imm == size_mask(inst.size()))
+			result = TEMP_REG1;
+		else if (is_logic_imm12(imm, inst.size()))
+			la_andi(&a, TEMP_REG3, TEMP_REG1, int32_t(uint32_t(imm)));
+		else
+		{
+			mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
+			la_and(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+		}
+	}
+	else
+	{
+		mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
+		la_and(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+	}
+
+	if (inst.size() == 4)
+		zero_extend32(a, result);
+	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 	if (inst.flags())
 	{
-		emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
+		emit_flags_nz(a, result, bits, FLAG_TMP_REG);
 		merge_flags(a, FLAG_Z | FLAG_S);
 	}
 }
@@ -3251,13 +3904,37 @@ void drcbe_la64::op_test(lagoon_assembler_t &a, const uml::instruction &inst)
 		return;
 	}
 
-	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
-	mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
-	la_and(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-	if (inst.size() == 4)
-		zero_extend32(a, TEMP_REG3);
+	if (src1p.is_immediate())
+	{
+		using std::swap;
+		swap(src1p, src2p);
+	}
 
-	emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
+	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
+
+	la_gpr_t result = TEMP_REG3;
+	if (src2p.is_immediate())
+	{
+		uint64_t const imm = (inst.size() == 4) ? uint64_t(uint32_t(src2p.immediate())) : src2p.immediate();
+		if (imm == size_mask(inst.size()))
+			result = TEMP_REG1;
+		else if (is_logic_imm12(imm, inst.size()))
+			la_andi(&a, TEMP_REG3, TEMP_REG1, int32_t(uint32_t(imm)));
+		else
+		{
+			mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
+			la_and(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+		}
+	}
+	else
+	{
+		mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
+		la_and(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+	}
+
+	if (inst.size() == 4)
+		zero_extend32(a, result);
+	emit_flags_nz(a, result, bits, FLAG_TMP_REG);
 	merge_flags(a, FLAG_Z | FLAG_S);
 }
 
@@ -3273,15 +3950,35 @@ void drcbe_la64::op_or(lagoon_assembler_t &a, const uml::instruction &inst)
 	const int bits = inst.size() * 8;
 
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
-	mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
-	la_or(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-	if (inst.size() == 4)
-		zero_extend32(a, TEMP_REG3);
 
-	mov_param_reg(a, inst.size(), dstp, TEMP_REG3);
+	la_gpr_t result = TEMP_REG3;
+	if (src2p.is_immediate())
+	{
+		uint64_t const imm = (inst.size() == 4) ? uint64_t(uint32_t(src2p.immediate())) : src2p.immediate();
+		if (imm == 0)
+			result = TEMP_REG1;
+		else if (imm == size_mask(inst.size()))
+			la_addi_d(&a, TEMP_REG3, LA_ZERO, -1);
+		else if (is_logic_imm12(imm, inst.size()))
+			la_ori(&a, TEMP_REG3, TEMP_REG1, int32_t(uint32_t(imm)));
+		else
+		{
+			mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
+			la_or(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+		}
+	}
+	else
+	{
+		mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
+		la_or(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+	}
+
+	if (inst.size() == 4)
+		zero_extend32(a, result);
+	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 	if (inst.flags())
 	{
-		emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
+		emit_flags_nz(a, result, bits, FLAG_TMP_REG);
 		merge_flags(a, FLAG_Z | FLAG_S);
 	}
 }
@@ -3298,15 +3995,35 @@ void drcbe_la64::op_xor(lagoon_assembler_t &a, const uml::instruction &inst)
 	const int bits = inst.size() * 8;
 
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
-	mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
-	la_xor(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-	if (inst.size() == 4)
-		zero_extend32(a, TEMP_REG3);
 
-	mov_param_reg(a, inst.size(), dstp, TEMP_REG3);
+	la_gpr_t result = TEMP_REG3;
+	if (src2p.is_immediate())
+	{
+		uint64_t const imm = (inst.size() == 4) ? uint64_t(uint32_t(src2p.immediate())) : src2p.immediate();
+		if (imm == 0)
+			result = TEMP_REG1;
+		else if (imm == size_mask(inst.size()))
+			la_nor(&a, TEMP_REG3, TEMP_REG1, LA_ZERO);
+		else if (is_logic_imm12(imm, inst.size()))
+			la_xori(&a, TEMP_REG3, TEMP_REG1, int32_t(uint32_t(imm)));
+		else
+		{
+			mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
+			la_xor(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+		}
+	}
+	else
+	{
+		mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
+		la_xor(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+	}
+
+	if (inst.size() == 4)
+		zero_extend32(a, result);
+	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 	if (inst.flags())
 	{
-		emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
+		emit_flags_nz(a, result, bits, FLAG_TMP_REG);
 		merge_flags(a, FLAG_Z | FLAG_S);
 	}
 }
@@ -3402,6 +4119,67 @@ template <int Opcode> void drcbe_la64::op_shift(lagoon_assembler_t &a, const uml
 	be_parameter src2p(*this, inst.param(2), PTYPE_MRI);
 	const int bits = inst.size() * 8;
 
+	if (src2p.is_immediate())
+	{
+		uint32_t const shift = uint32_t(src2p.immediate()) & (bits - 1);
+		mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
+
+		if (shift == 0)
+		{
+			write_result(a, inst.size(), dstp, TEMP_REG1, true);
+			if (inst.flags())
+			{
+				emit_flags_nz(a, TEMP_REG1, bits, FLAG_TMP_REG);
+				merge_flags(a, FLAG_Z | FLAG_S);
+			}
+			return;
+		}
+
+		if (Opcode == 0)
+		{
+			if (inst.size() == 4)
+				la_slli_w(&a, TEMP_REG3, TEMP_REG1, shift);
+			else
+				la_slli_d(&a, TEMP_REG3, TEMP_REG1, shift);
+		}
+		else if (Opcode == 1)
+		{
+			if (inst.size() == 4)
+				la_srli_w(&a, TEMP_REG3, TEMP_REG1, shift);
+			else
+				la_srli_d(&a, TEMP_REG3, TEMP_REG1, shift);
+		}
+		else if (Opcode == 2)
+		{
+			if (inst.size() == 4)
+				la_srai_w(&a, TEMP_REG3, TEMP_REG1, shift);
+			else
+				la_srai_d(&a, TEMP_REG3, TEMP_REG1, shift);
+		}
+		else
+		{
+			if (inst.size() == 4)
+				la_rotri_w(&a, TEMP_REG3, TEMP_REG1, shift);
+			else
+				la_rotri_d(&a, TEMP_REG3, TEMP_REG1, shift);
+		}
+
+		if (inst.size() == 4)
+			zero_extend32(a, TEMP_REG3);
+		write_result(a, inst.size(), dstp, TEMP_REG3, inst.size() == 4);
+
+		if (inst.flags())
+		{
+			emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
+			int const carrybit = (Opcode == 0) ? (bits - shift) : (shift - 1);
+			la_srli_d(&a, LA_T3, TEMP_REG1, carrybit);
+			la_andi(&a, LA_T3, LA_T3, 1);
+			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
+			merge_flags(a, FLAG_C | FLAG_Z | FLAG_S);
+		}
+		return;
+	}
+
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
 	mov_reg_param(a, 4, TEMP_REG2, src2p);
 	la_andi(&a, TEMP_REG2, TEMP_REG2, bits - 1);
@@ -3482,6 +4260,43 @@ void drcbe_la64::op_rol(lagoon_assembler_t &a, const uml::instruction &inst)
 	be_parameter src2p(*this, inst.param(2), PTYPE_MRI);
 	const int bits = inst.size() * 8;
 
+	if (src2p.is_immediate())
+	{
+		uint32_t const shift = uint32_t(src2p.immediate()) & (bits - 1);
+		mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
+
+		if (shift == 0)
+		{
+			write_result(a, inst.size(), dstp, TEMP_REG1, true);
+			if (inst.flags())
+			{
+				emit_flags_nz(a, TEMP_REG1, bits, FLAG_TMP_REG);
+				merge_flags(a, FLAG_Z | FLAG_S);
+			}
+			return;
+		}
+
+		uint32_t const rotate = (bits - shift) & (bits - 1);
+		if (inst.size() == 4)
+			la_rotri_w(&a, TEMP_REG3, TEMP_REG1, rotate);
+		else
+			la_rotri_d(&a, TEMP_REG3, TEMP_REG1, rotate);
+
+		if (inst.size() == 4)
+			zero_extend32(a, TEMP_REG3);
+		write_result(a, inst.size(), dstp, TEMP_REG3, inst.size() == 4);
+
+		if (inst.flags())
+		{
+			emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
+			la_srli_d(&a, LA_T3, TEMP_REG1, bits - shift);
+			la_andi(&a, LA_T3, LA_T3, 1);
+			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
+			merge_flags(a, FLAG_C | FLAG_Z | FLAG_S);
+		}
+		return;
+	}
+
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
 	mov_reg_param(a, 4, TEMP_REG2, src2p);
 	la_andi(&a, TEMP_REG2, TEMP_REG2, bits - 1);
@@ -3493,7 +4308,7 @@ void drcbe_la64::op_rol(lagoon_assembler_t &a, const uml::instruction &inst)
 	if (inst.size() == 4)
 		zero_extend32(a, TEMP_REG3);
 
-	mov_param_reg(a, inst.size(), dstp, TEMP_REG3);
+	write_result(a, inst.size(), dstp, TEMP_REG3, inst.size() == 4);
 
 	if (inst.flags())
 	{
@@ -3690,11 +4505,13 @@ void drcbe_la64::op_mulu(lagoon_assembler_t &a, const uml::instruction &inst)
 	{
 		la_mul_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
 		la_bstrpick_d(&a, LA_T3, TEMP_REG3, 31, 0);
-		la_srli_d(&a, LA_T4, TEMP_REG3, 32);
 
 		mov_param_reg(a, 4, dstp, LA_T3);
 		if (compute_hi)
+		{
+			la_srli_d(&a, LA_T4, TEMP_REG3, 32);
 			mov_param_reg(a, 4, edstp, LA_T4);
+		}
 
 		if (inst.flags())
 		{
@@ -3710,7 +4527,8 @@ void drcbe_la64::op_mulu(lagoon_assembler_t &a, const uml::instruction &inst)
 	else
 	{
 		la_mul_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-		la_mulh_du(&a, LA_T3, TEMP_REG1, TEMP_REG2);
+		if (compute_hi || inst.flags())
+			la_mulh_du(&a, LA_T3, TEMP_REG1, TEMP_REG2);
 
 		mov_param_reg(a, 8, dstp, TEMP_REG3);
 		if (compute_hi)
@@ -3767,7 +4585,8 @@ void drcbe_la64::op_mululw(lagoon_assembler_t &a, const uml::instruction &inst)
 	else
 	{
 		la_mul_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-		la_mulh_du(&a, LA_T3, TEMP_REG1, TEMP_REG2);
+		if (inst.flags() & FLAG_V)
+			la_mulh_du(&a, LA_T3, TEMP_REG1, TEMP_REG2);
 		mov_param_reg(a, 8, dstp, TEMP_REG3);
 
 		if (inst.flags())
@@ -3803,11 +4622,13 @@ void drcbe_la64::op_muls(lagoon_assembler_t &a, const uml::instruction &inst)
 		sign_extend32(a, TEMP_REG2);
 		la_mul_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
 		la_bstrpick_d(&a, LA_T3, TEMP_REG3, 31, 0);
-		la_srli_d(&a, LA_T4, TEMP_REG3, 32);
 
 		mov_param_reg(a, 4, dstp, LA_T3);
 		if (compute_hi)
+		{
+			la_srli_d(&a, LA_T4, TEMP_REG3, 32);
 			mov_param_reg(a, 4, edstp, LA_T4);
+		}
 
 		if (inst.flags())
 		{
@@ -3825,7 +4646,8 @@ void drcbe_la64::op_muls(lagoon_assembler_t &a, const uml::instruction &inst)
 	else
 	{
 		la_mul_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-		la_mulh_d(&a, LA_T3, TEMP_REG1, TEMP_REG2);
+		if (compute_hi || inst.flags())
+			la_mulh_d(&a, LA_T3, TEMP_REG1, TEMP_REG2);
 
 		mov_param_reg(a, 8, dstp, TEMP_REG3);
 		if (compute_hi)
@@ -3888,7 +4710,8 @@ void drcbe_la64::op_mulslw(lagoon_assembler_t &a, const uml::instruction &inst)
 	else
 	{
 		la_mul_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-		la_mulh_d(&a, LA_T3, TEMP_REG1, TEMP_REG2);
+		if (inst.flags() & FLAG_V)
+			la_mulh_d(&a, LA_T3, TEMP_REG1, TEMP_REG2);
 		mov_param_reg(a, 8, dstp, TEMP_REG3);
 
 		if (inst.flags())
@@ -3930,27 +4753,32 @@ template <bool Signed> void drcbe_la64::op_div(lagoon_assembler_t &a, const uml:
 		if (Signed)
 		{
 			la_div_w(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-			la_mod_w(&a, LA_T3, TEMP_REG1, TEMP_REG2);
+			if (compute_rem)
+				la_mod_w(&a, LA_T3, TEMP_REG1, TEMP_REG2);
 		}
 		else
 		{
 			la_div_wu(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-			la_mod_wu(&a, LA_T3, TEMP_REG1, TEMP_REG2);
+			if (compute_rem)
+				la_mod_wu(&a, LA_T3, TEMP_REG1, TEMP_REG2);
 		}
 		zero_extend32(a, TEMP_REG3);
-		zero_extend32(a, LA_T3);
+		if (compute_rem)
+			zero_extend32(a, LA_T3);
 	}
 	else
 	{
 		if (Signed)
 		{
 			la_div_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-			la_mod_d(&a, LA_T3, TEMP_REG1, TEMP_REG2);
+			if (compute_rem)
+				la_mod_d(&a, LA_T3, TEMP_REG1, TEMP_REG2);
 		}
 		else
 		{
 			la_div_du(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-			la_mod_du(&a, LA_T3, TEMP_REG1, TEMP_REG2);
+			if (compute_rem)
+				la_mod_du(&a, LA_T3, TEMP_REG1, TEMP_REG2);
 		}
 	}
 
@@ -3985,6 +4813,16 @@ void drcbe_la64::op_carry(lagoon_assembler_t &a, const uml::instruction &inst)
 	be_parameter bitp(*this, inst.param(1), PTYPE_MRI);
 	const int bits = inst.size() * 8;
 
+	if (srcp.is_immediate() && bitp.is_immediate())
+	{
+		uint64_t const bit = (srcp.immediate() >> (bitp.immediate() & (bits - 1))) & 1;
+		if (bit)
+			la_ori(&a, FLAGS_REG, FLAGS_REG, uml::FLAG_C);
+		else
+			la_andi(&a, FLAGS_REG, FLAGS_REG, int32_t(~uml::FLAG_C));
+		return;
+	}
+
 	mov_reg_param(a, inst.size(), TEMP_REG1, srcp);
 	if (bitp.is_immediate())
 	{
@@ -4015,7 +4853,7 @@ void drcbe_la64::op_read(lagoon_assembler_t &a, const uml::instruction &inst)
 	auto const &accessors = m_memory_accessors[spacesizep.space()];
 	bool const have_specific = (uintptr_t(nullptr) != accessors.specific.read.function) || accessors.specific.read.is_virtual;
 
-	emit_sync_fcsr(a);
+	emit_fcsr_sync_if_changed(a);
 
 	if (have_specific && ((1 << spacesizep.size()) == accessors.specific.native_bytes))
 	{
@@ -4025,6 +4863,16 @@ void drcbe_la64::op_read(lagoon_assembler_t &a, const uml::instruction &inst)
 		else
 			load_imm32(a, REG_PARAM3, uint32_t((uint64_t(1) << (accessors.specific.native_bytes * 8)) - 1));
 		emit_specific_call(a, accessors.specific.read);
+	}
+	else if (have_specific && ((1 << spacesizep.size()) < accessors.specific.native_bytes))
+	{
+		if (spacesizep.size() == SIZE_BYTE)
+			load_imm32(a, REG_PARAM3, 0xff);
+		else if (spacesizep.size() == SIZE_WORD)
+			load_imm32(a, REG_PARAM3, 0xffff);
+		else
+			load_imm32(a, REG_PARAM3, 0xffffffff);
+		emit_narrow_memread(a, addrp, spacesizep, accessors);
 	}
 	else
 	{
@@ -4056,7 +4904,7 @@ void drcbe_la64::op_read(lagoon_assembler_t &a, const uml::instruction &inst)
 		zero_extend32(a, REG_PARAM1);
 
 	mov_param_reg(a, inst.size(), dstp, REG_PARAM1);
-	emit_sync_fcsr(a);
+	emit_fcsr_sync_if_changed(a);
 }
 
 void drcbe_la64::op_readm(lagoon_assembler_t &a, const uml::instruction &inst)
@@ -4074,13 +4922,18 @@ void drcbe_la64::op_readm(lagoon_assembler_t &a, const uml::instruction &inst)
 	auto const &accessors = m_memory_accessors[spacesizep.space()];
 	bool const have_specific = (uintptr_t(nullptr) != accessors.specific.read.function) || accessors.specific.read.is_virtual;
 
-	emit_sync_fcsr(a);
+	emit_fcsr_sync_if_changed(a);
 
 	if (have_specific && ((1 << spacesizep.size()) == accessors.specific.native_bytes))
 	{
 		emit_memaccess_setup(a, addrp, accessors, accessors.specific.read);
 		mov_reg_param(a, inst.size(), REG_PARAM3, maskp);
 		emit_specific_call(a, accessors.specific.read);
+	}
+	else if (have_specific && ((1 << spacesizep.size()) < accessors.specific.native_bytes))
+	{
+		mov_reg_param(a, inst.size(), REG_PARAM3, maskp);
+		emit_narrow_memread(a, addrp, spacesizep, accessors);
 	}
 	else
 	{
@@ -4122,7 +4975,7 @@ void drcbe_la64::op_readm(lagoon_assembler_t &a, const uml::instruction &inst)
 		zero_extend32(a, REG_PARAM1);
 
 	mov_param_reg(a, inst.size(), dstp, REG_PARAM1);
-	emit_sync_fcsr(a);
+	emit_fcsr_sync_if_changed(a);
 }
 
 void drcbe_la64::op_write(lagoon_assembler_t &a, const uml::instruction &inst)
@@ -4139,7 +4992,7 @@ void drcbe_la64::op_write(lagoon_assembler_t &a, const uml::instruction &inst)
 	auto const &accessors = m_memory_accessors[spacesizep.space()];
 	bool const have_specific = (uintptr_t(nullptr) != accessors.specific.write.function) || accessors.specific.write.is_virtual;
 
-	emit_sync_fcsr(a);
+	emit_fcsr_sync_if_changed(a);
 
 	if (have_specific && ((1 << spacesizep.size()) == accessors.specific.native_bytes))
 	{
@@ -4150,6 +5003,17 @@ void drcbe_la64::op_write(lagoon_assembler_t &a, const uml::instruction &inst)
 		else
 			load_imm32(a, REG_PARAM4, uint32_t((uint64_t(1) << (accessors.specific.native_bytes * 8)) - 1));
 		emit_specific_call(a, accessors.specific.write);
+	}
+	else if (have_specific && ((1 << spacesizep.size()) < accessors.specific.native_bytes))
+	{
+		mov_reg_param(a, inst.size(), REG_PARAM3, srcp);
+		if (spacesizep.size() == SIZE_BYTE)
+			load_imm32(a, REG_PARAM4, 0xff);
+		else if (spacesizep.size() == SIZE_WORD)
+			load_imm32(a, REG_PARAM4, 0xffff);
+		else
+			load_imm32(a, REG_PARAM4, 0xffffffff);
+		emit_narrow_memwrite(a, addrp, spacesizep, accessors);
 	}
 	else
 	{
@@ -4181,7 +5045,7 @@ void drcbe_la64::op_write(lagoon_assembler_t &a, const uml::instruction &inst)
 		call_helper_addr(a, func);
 	}
 
-	emit_sync_fcsr(a);
+	emit_fcsr_sync_if_changed(a);
 }
 
 void drcbe_la64::op_writem(lagoon_assembler_t &a, const uml::instruction &inst)
@@ -4199,7 +5063,7 @@ void drcbe_la64::op_writem(lagoon_assembler_t &a, const uml::instruction &inst)
 	auto const &accessors = m_memory_accessors[spacesizep.space()];
 	bool const have_specific = (uintptr_t(nullptr) != accessors.specific.write.function) || accessors.specific.write.is_virtual;
 
-	emit_sync_fcsr(a);
+	emit_fcsr_sync_if_changed(a);
 
 	if (have_specific && ((1 << spacesizep.size()) == accessors.specific.native_bytes))
 	{
@@ -4207,6 +5071,12 @@ void drcbe_la64::op_writem(lagoon_assembler_t &a, const uml::instruction &inst)
 		mov_reg_param(a, inst.size(), REG_PARAM3, srcp);
 		mov_reg_param(a, inst.size(), REG_PARAM4, maskp);
 		emit_specific_call(a, accessors.specific.write);
+	}
+	else if (have_specific && ((1 << spacesizep.size()) < accessors.specific.native_bytes))
+	{
+		mov_reg_param(a, inst.size(), REG_PARAM3, srcp);
+		mov_reg_param(a, inst.size(), REG_PARAM4, maskp);
+		emit_narrow_memwrite(a, addrp, spacesizep, accessors);
 	}
 	else
 	{
@@ -4239,7 +5109,7 @@ void drcbe_la64::op_writem(lagoon_assembler_t &a, const uml::instruction &inst)
 		call_helper_addr(a, func);
 	}
 
-	emit_sync_fcsr(a);
+	emit_fcsr_sync_if_changed(a);
 }
 
 
@@ -4330,7 +5200,7 @@ void drcbe_la64::op_fread(lagoon_assembler_t &a, const uml::instruction &inst)
 
 	auto const &accessors = m_memory_accessors[spacesizep.space()];
 
-	emit_sync_fcsr(a);
+	emit_fcsr_sync_if_changed(a);
 
 	mov_reg_param(a, 4, REG_PARAM2, addrp);
 	if (inst.size() == 4)
@@ -4345,7 +5215,7 @@ void drcbe_la64::op_fread(lagoon_assembler_t &a, const uml::instruction &inst)
 	}
 
 	mov_float_param_int_reg(a, inst.size(), dstp, REG_PARAM1);
-	emit_sync_fcsr(a);
+	emit_fcsr_sync_if_changed(a);
 }
 
 void drcbe_la64::op_fwrite(lagoon_assembler_t &a, const uml::instruction &inst)
@@ -4362,7 +5232,7 @@ void drcbe_la64::op_fwrite(lagoon_assembler_t &a, const uml::instruction &inst)
 
 	auto const &accessors = m_memory_accessors[spacesizep.space()];
 
-	emit_sync_fcsr(a);
+	emit_fcsr_sync_if_changed(a);
 
 	mov_reg_param(a, 4, REG_PARAM2, addrp);
 	mov_float_reg_param(a, inst.size(), TEMPF_REG1, srcp);
@@ -4379,7 +5249,7 @@ void drcbe_la64::op_fwrite(lagoon_assembler_t &a, const uml::instruction &inst)
 		call_helper_addr(a, uintptr_t(accessors.resolved.write_qword.func));
 	}
 
-	emit_sync_fcsr(a);
+	emit_fcsr_sync_if_changed(a);
 }
 
 void drcbe_la64::op_fmov(lagoon_assembler_t &a, const uml::instruction &inst)
@@ -4723,14 +5593,12 @@ template <int Opcode> void drcbe_la64::op_float_alu2(lagoon_assembler_t &a, cons
 	case 3:
 		if (inst.size() == 4)
 		{
-			load_imm32(a, TEMP_REG1, 0x3f800000);
-			la_movgr2fr_w(&a, one, TEMP_REG1);
+			emit_float_ldr_state(a, one, &m_near.single1, 4);
 			la_fdiv_s(&a, dstreg, one, srcreg);
 		}
 		else
 		{
-			load_imm64(a, TEMP_REG1, 0x3ff0000000000000ULL);
-			la_movgr2fr_d(&a, one, TEMP_REG1);
+			emit_float_ldr_state(a, one, &m_near.double1, 8);
 			la_fdiv_d(&a, dstreg, one, srcreg);
 		}
 		break;
@@ -4738,15 +5606,13 @@ template <int Opcode> void drcbe_la64::op_float_alu2(lagoon_assembler_t &a, cons
 		if (inst.size() == 4)
 		{
 			la_fsqrt_s(&a, dstreg, srcreg);
-			load_imm32(a, TEMP_REG1, 0x3f800000);
-			la_movgr2fr_w(&a, one, TEMP_REG1);
+			emit_float_ldr_state(a, one, &m_near.single1, 4);
 			la_fdiv_s(&a, dstreg, one, dstreg);
 		}
 		else
 		{
 			la_fsqrt_d(&a, dstreg, srcreg);
-			load_imm64(a, TEMP_REG1, 0x3ff0000000000000ULL);
-			la_movgr2fr_d(&a, one, TEMP_REG1);
+			emit_float_ldr_state(a, one, &m_near.double1, 8);
 			la_fdiv_d(&a, dstreg, one, dstreg);
 		}
 		break;

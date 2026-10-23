@@ -109,7 +109,7 @@ bstrpick.d rd, rd, 31, 0     // 取低 32 位并零扩展
 直接照搬 ARM64 的 `emit_memaccess_setup` / `emit_narrow_memread` / `emit_narrow_memwrite` 结构：
 
 - UML `READ/WRITE/READM/WRITEM` 走 `m_memory_accessors`（`resolved_member_function` + `specific_access_info`）的快速路径
-- 32 位窄访问、非对齐、mask 情况走 helper
+- 小于原生宽度的窄访问走 `emit_narrow_memread/write`，在原生 word 内完成 data/mask 移位；非对齐、非原生宽度和复杂 mask 情况仍走 helper
 - `LOAD/STORE` 只用于 near cache / 寄存器，偏移要保证对齐
 - 注意 LoongArch 的 `ld.*/st.*` 要求自然对齐；guest 非对齐访问必须走地址空间 helper，不能直接发 `ld.w`
 
@@ -416,7 +416,7 @@ src/lib/util/abi.h               # 修正 LoongArch 成员函数指针布局
 - 顶层入口建立 160 字节栈帧，保存 `$ra`、`$fp`、`$r21`、`$s0-$s8`、`$fs0-$fs7`；handle 子程序使用 16 字节小帧。顶层栈帧指针保存在 `$r21`（ABI 保留寄存器，helper 调用不会破坏），入口把调用者的 `$r21` 存入栈帧、退出时恢复，因此递归 `execute()` 不会互相覆盖；`m_near` 只保存原始 FCSR。退出时先由 `$r21` 恢复 `$sp`，再恢复 FCSR 和所有 callee-saved 寄存器。
 - `m_exit` 会先把 `$sp` 恢复到 `$r21` 指向的顶层帧。这样即使 `EXIT` 发生在 `CALLH`/`EXH` 的 handle 内部而没有 `RET`，也不会读到错误的栈帧；`op_recover` 同样从 `$r21` 计算最外层子程序帧的返回地址。
 - FCSR 的 RM 字段按 `fmod ^ 1` 映射（UML trunc/round/ceil/floor -> LoongArch RZ/RNE/RP/RM）；`SETFMOD`、`RESTORE`、入口和 helper 调用前后都会同步宿主 FCSR。
-- 内存访问对“访问宽度等于 address space 原生宽度”的情况走 `specific_access_info` 快速路径，窄访问和非原生宽度、masked 访问走 `resolved_memory_accessors` 通用路径。
+- 内存访问对“访问宽度等于 address space 原生宽度”的情况走 `specific_access_info` 快速路径；小于原生宽度的情况走新增的 `emit_narrow_memread/write`（在原生 word 内移位 data/mask）；非原生宽度、复杂 mask 和非对齐情况走 `resolved_memory_accessors` 通用路径。
 - `-drc_log_native` 使用 lagoon 的 `la_disasm_one()`/`la_insn_to_str()` 输出反汇编；transient block 会等所有 label 回填完成后再输出，避免日志里看到未回填的 `b 0`。
 - lagoon 的生命周期、缓冲区剩余空间检查、`begin_codegen()`/`end_codegen()` 和失败时的 `block.abort()` 都按报告建议处理。
 
@@ -587,7 +587,7 @@ make -j"$(nproc)" SUBTARGET=drc_condtest SOURCES=src/mame/test/drc_condtest.cpp
 
 结果：
 
-- 原生后端和 `-drc_use_c` 都输出 `drc_condtest: PASS (16 conditions x 32 flag combinations x 2 paths, 2048 CMP/TEST + branch cases)`。
+- 原生后端和 `-drc_use_c` 都输出 `drc_condtest: PASS (16 conditions x 32 flag combinations x 2 paths, 2048 CMP/TEST + branch cases, 36 ALU cases)`。
 - 临时把 `COND_A`/`COND_BE` 改回修复前的实现重新构建，测试立即报告 64 个不匹配（`COND_A` 和 `COND_BE` 各 16 种标志组合 × 2 条路径），说明该测试确实能捕获这次回归。
 - 同一个测试现在还覆盖 `CMP/TEST + JMPc` 融合：8 组操作数 × 32/64 位 × 寄存器/立即数/内存/自比较等操作数形式 × 全部适用条件，共 2048 个检查；原生后端必须与 `-drc_use_c` 的结果一致。此外还有一个跨越块内 `HANDLE` 回退路径的活性用例，确保 CFG 分析不会漏掉该路径上的标志位读取。
 
@@ -610,7 +610,7 @@ make -j"$(nproc)" SUBTARGET=drc_condtest SOURCES=src/mame/test/drc_condtest.cpp
      脚本分别运行原生后端和 `-drc_use_c`，两者都输出：
 
      ```
-     drc_specifictest: PASS (8 dword reads + 8 dword writes + mask-sensitive register, 32-bit native space)
+     drc_specifictest: PASS (8 dword + 32 byte + 16 word reads, 8 dword + 8 narrow writes + mask-sensitive registers, 32-bit native space)
      ```
 
    - 临时把 `op_read`/`op_write` 的掩码改回 0 重新构建，测试立即报告 9 个不匹配（7 个写入数据 + 2 个掩码），退出码非 0，说明该测试确实能捕获“读错/写丢”型回归。
@@ -642,8 +642,8 @@ make -j"$(nproc)" SUBTARGET=drc_condtest SOURCES=src/mame/test/drc_condtest.cpp
 现在 `lagoon.c` 增加 `la_sign_extend()`，在装载 20 位 `lu12i.w`/`lu32i.d` 字段和 12 位 `lu52i.d`/`addi.w` 字段时先做符号扩展，再传给 lagoon 的编码函数。修正后两个测试在原生和 `-drc_use_c` 后端均通过：
 
 ```
-drc_condtest: PASS (16 conditions x 32 flag combinations x 2 paths, 2048 CMP/TEST + branch cases)
-drc_specifictest: PASS (8 dword reads + 8 dword writes + mask-sensitive register, 32-bit native space)
+drc_condtest: PASS (16 conditions x 32 flag combinations x 2 paths, 2048 CMP/TEST + branch cases, 36 ALU cases)
+drc_specifictest: PASS (8 dword + 32 byte + 16 word reads, 8 dword + 8 narrow writes + mask-sensitive registers, 32-bit native space)
 ```
 
 ### 9.5 后续工作
@@ -651,3 +651,42 @@ drc_specifictest: PASS (8 dword reads + 8 dword writes + mask-sensitive register
 - POWERPC、UNSP、ADSP(SHARC)、DSPP 的真实 ROM 回归尚未完成；拿到合法 ROM/可构建的开源测试程序后，继续按 9.4.1 的用例清单做 native vs `-drc_use_c` A/B。
 - `lagoon.c` 只在 Debug 和 `drc_*test` 测试构建中用 `-DLA_DEBUG` 编译（测试的 Release 构建通过 `-UNDEBUG` 保持断言，Release `mame` 不带 `LA_DEBUG`）；`la_load_immediate32/64()` 的 20/12 位立即数已按 9.4.7 完成符号扩展修正。
 - 已实现 `emit_skip` 标志位直接分支、`CMP/TEST + JMPc` 融合、CMP/TEST 常量折叠和远端条件分支的分支岛；标志位活性检查已从跟随 UML 优化器的线性模型扩展为基于控制流图的迭代数据流分析，覆盖条件跳转、条件退出/返回、调用以及循环回边。
+- 本轮已补齐立即数/位域、窄内存、FCSR 条件同步、基址寻址、indexed LOAD/STORE、乘除法按需计算、move 同寄存器消除和浮点常量池等优化；`drc_condtest` 新增 32/64 位 ALU 定向用例，`drc_specifictest` 新增窄访问、masked narrow 和 indexed LOAD/STORE 用例。剩余差距和评估结论见 9.6。
+
+### 9.6 相对 x86_64/aarch64 后端的优化差距与实现状态
+
+`drcbela64` 已覆盖全部 UML opcode；x64 的原生 EFLAGS、arm64 的 NZCV 属于 ISA 特性，不能直接照搬。本轮按原清单补齐了以下可移植优化，并保留了少量仍待处理的项。
+
+| 优化项 | 状态 | 说明 |
+| --- | --- | --- |
+| ALU 立即数/位域 | 已实现 | ADD/SUB（无 flags）、AND/OR/XOR/TEST、立即数移位/旋转、BFXU/BFXS/ROLAND/ROLINS 快路径，CARRY 常量折叠 |
+| 窄内存访问 | 已实现 | 新增 `emit_narrow_memaccess_setup/read/write`，小于 `native_bytes` 的访问在原生 word 内移位 data/mask；`drc_specifictest` 覆盖 byte/word 读写和 masked narrow 访问 |
+| FCSR/fmod 同步 | 已实现 | `near_state` 增加 `nominal_fmod`/`fmod_changed`，内存/helper 调用前后仅在 fmod 变化时同步；`SETFMOD` 相同值直接跳过 |
+| 基址寻址 | 已实现 | `$fp`（`BASE_REG`）用于 `m_state`/`m_near` 的 1 条 ld/st（12 位偏移），超出范围回退到 `la_la_local` |
+| 乘除法按需计算 | 已实现 | 仅当输出高位或 V flag 需要时才发 `mulh`；仅当需要余数时才发 `mod` |
+| move 同寄存器/写回 | 部分实现 | `mov_reg_param`/`mov_param_reg` 跳过 `src == dst`；`write_result` 统一处理零扩展和写回。通用 ALU 仍先写 `TEMP_REG3` 再 move |
+| 浮点常量池 | 已实现 | `near_state` 缓存 `1.0f`/`1.0`，FRECIP/FRSQRT 不再每次重建 |
+| 条件移动 | 未实现（评估后保留） | `maskeqz/masknez` 需要 3 条 + 条件求值，通常不优于现有 branch-skip；x64 `cmov`/arm64 `csel` 是单条指令 |
+| flag 子集/延迟计算 | 未实现 | ADD/SUB/CMP 仍计算完整 C/V/Z/S；CFG 活性目前只用于 CMP/TEST 融合 |
+| FTOINT 跳表/FCMP | 未实现 | `ROUND_DEFAULT` 仍用 4 分支链；FCMP 仍用 3 条 `fcmp` 合成 C/Z/U |
+| indexed LOAD/STORE | 已实现 | 使用 `ldx/stx` 去掉 base+index 的额外 `add`；目标寄存器仍经 `TEMP_REG3` 中转 |
+| 固定生成缓冲区 | 未实现 | 仍按 `1024 B/指令` 预留，超出 `block.abort()`；asmjit 后端可增长/重试 |
+
+#### 9.6.1 已实现的立即数/位域路径
+
+- `ADD/SUB` 在无 flags 且第二操作数为 12 位立即数时直接发 `addi.w/d`；`AND/OR/XOR/TEST` 对 0、全 1、12 位有符号逻辑立即数和非 12 位常量分别处理，后者才加载到临时寄存器。
+- `SHL/SHR/SAR/ROL/ROR` 在 count 为立即数时直接发 `slli/srli/srai/rotri`，并按常量直接计算 C flag；`BFXU/BFXS` 在 shift/width 都是立即数时使用 `bstrpick` 或 `rotri+bstrpick`；`ROLAND/ROLINS` 对连续 mask 使用 `bstrpick+bstrins`。
+- `CARRY` 的两个操作数都是常量时直接对 `FLAG_C` 做 `ori/andi`。
+
+#### 9.6.2 已实现的 FCSR/基址优化
+
+- 入口从宿主 FCSR 反推出 `nominal_fmod`，并记录 guest `m_state.fmod` 是否与宿主一致；`SETFMOD` 值未变化时直接跳过，变化时更新 `fmod_changed`。
+- `READ/WRITE/FREAD/FWRITE/CALLC/DEBUG/RECOVER` 的 FCSR 同步改为先读 `m_near.fmod_changed`，为 0 时跳过前后两次 `emit_sync_fcsr()`；flag 寄存器在这些 opcode 中本来就会被修改，可安全用于条件判断。
+- `m_state` 和 `m_near` 的访问通过 `$fp` 基址 + 12 位偏移完成；偏移超出范围时回退原来的 `la_la_local`。`SAVE/RESTORE` 的冷寄存器路径也复用了该基址。
+
+#### 9.6.3 仍保留的差距
+
+- 通用整数 ALU 仍固定先写 `TEMP_REG3` 再 move 到目标；要彻底消除需要引入 `dstp.select_register()` 风格的别名选择，并同步调整 flags 计算。
+- `ADD/SUB/CMP` 仍总是计算完整标志位；可按 `inst.flags()` 只算 Z/S/C/V 的子集，或做延迟标志位。
+- 条件移动没有改用 `maskeqz/masknez`，原因见上表：LoongArch 缺少单条 csel/cmov，3 条 mask/or 序列在多数情况下不优于可预测的分支。
+- FTOINT/FCMP 仍保留原实现；这些属于局部收益，优先级低于上述已落地项。

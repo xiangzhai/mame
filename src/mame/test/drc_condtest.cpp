@@ -21,6 +21,7 @@
 #include "cpu/drccache.h"
 
 #include <array>
+#include <bit>
 #include <memory>
 
 
@@ -67,6 +68,14 @@ private:
 	std::array<u32, MAX_FUSION_CASES> m_fusion_results{};
 	std::array<u32, MAX_FUSION_CASES> m_fusion_expected{};
 	std::array<u64, MAX_FUSION_CASES> m_fusion_operands{};
+
+	static constexpr int ALU_RESULT_COUNT = 28;
+	std::array<u32, ALU_RESULT_COUNT> m_alu_results{};
+	std::array<u32, ALU_RESULT_COUNT> m_alu_extra{};
+
+	static constexpr int ALU64_RESULT_COUNT = 8;
+	std::array<u64, ALU64_RESULT_COUNT> m_alu64_results{};
+	std::array<u64, ALU64_RESULT_COUNT> m_alu64_extra{};
 };
 
 
@@ -373,6 +382,157 @@ void drc_condtest_state::machine_start()
 		UML_STORE(block, &m_cfg_result, 0, uml::I2, SIZE_DWORD, SCALE_x1);
 	}
 
+	// ALU immediate/bitfield/multiply/divide lowering.  These exercise the
+	// backend's specialised paths and are checked against independently
+	// computed C++ results below.
+	int ai = 0;
+	auto save_i0 = [&](int index) { UML_STORE(block, &m_alu_results[index], 0, uml::I0, SIZE_DWORD, SCALE_x1); };
+	auto save_i1 = [&](int index) { UML_STORE(block, &m_alu_extra[index], 0, uml::I1, SIZE_DWORD, SCALE_x1); };
+
+	UML_MOV(block, uml::I0, u32(0x12345678));
+	UML_ADD(block, uml::I0, uml::I0, u32(0x123));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0x12345678));
+	UML_SUB(block, uml::I0, uml::I0, u32(0x123));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0xdeadbeef));
+	UML_AND(block, uml::I0, uml::I0, u32(0x7f));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0xdeadbeef));
+	UML_AND(block, uml::I0, uml::I0, u32(0x00ff00ff));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0x12345678));
+	UML_OR(block, uml::I0, uml::I0, u32(0x7f));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0x12345678));
+	UML_OR(block, uml::I0, uml::I0, u32(0xffffffff));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0x12345678));
+	UML_XOR(block, uml::I0, uml::I0, u32(0x7f));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0x12345678));
+	UML_XOR(block, uml::I0, uml::I0, u32(0xffffffff));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0x92345678));
+	UML_SHL(block, uml::I0, uml::I0, u32(3));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0x92345678));
+	UML_SHR(block, uml::I0, uml::I0, u32(5));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0x92345678));
+	UML_SAR(block, uml::I0, uml::I0, u32(7));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0x92345678));
+	UML_ROR(block, uml::I0, uml::I0, u32(9));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0x92345678));
+	UML_ROL(block, uml::I0, uml::I0, u32(11));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0xdeadbeef));
+	UML_BFXU(block, uml::I0, uml::I0, u32(4), u32(8));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0xdeadbeef));
+	UML_BFXU(block, uml::I0, uml::I0, u32(28), u32(8));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0xdeadbeef));
+	UML_BFXS(block, uml::I0, uml::I0, u32(4), u32(8));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0xdeadbeef));
+	UML_BFXS(block, uml::I0, uml::I0, u32(28), u32(8));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0xdeadbeef));
+	UML_ROLAND(block, uml::I0, uml::I0, u32(4), u32(0x00ff0000));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I0, u32(0x11223344));
+	UML_MOV(block, uml::I1, u32(0xdeadbeef));
+	UML_ROLINS(block, uml::I0, uml::I1, u32(4), u32(0x00ff0000));
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I2, u32(0x12345678));
+	UML_MOV(block, uml::I3, u32(0x9abcdef0));
+	UML_MULU(block, uml::I0, uml::I1, uml::I2, uml::I3);
+	save_i0(ai++);
+	save_i1(ai - 1);
+
+	UML_MOV(block, uml::I2, u32(0x12345678));
+	UML_MOV(block, uml::I3, u32(0x9abcdef0));
+	UML_MULULW(block, uml::I0, uml::I2, uml::I3);
+	save_i0(ai++);
+
+	UML_MOV(block, uml::I2, u32(0x80000001));
+	UML_MOV(block, uml::I3, u32(0x12345678));
+	UML_MULS(block, uml::I0, uml::I1, uml::I2, uml::I3);
+	save_i0(ai++);
+	save_i1(ai - 1);
+
+	UML_MOV(block, uml::I2, u32(0x89abcdef));
+	UML_MOV(block, uml::I3, u32(0x00012345));
+	UML_DIVU(block, uml::I0, uml::I1, uml::I2, uml::I3);
+	save_i0(ai++);
+	save_i1(ai - 1);
+
+	UML_MOV(block, uml::I2, u32(0xf9abcdef));
+	UML_MOV(block, uml::I3, u32(0x00012345));
+	UML_DIVS(block, uml::I0, uml::I1, uml::I2, uml::I3);
+	save_i0(ai++);
+	save_i1(ai - 1);
+
+	int a64 = 0;
+	auto save64 = [&](int index) { UML_DSTORE(block, &m_alu64_results[index], 0, uml::I0, SIZE_QWORD, SCALE_x1); };
+	auto save64_extra = [&](int index) { UML_DSTORE(block, &m_alu64_extra[index], 0, uml::I1, SIZE_QWORD, SCALE_x1); };
+
+	UML_DMOV(block, uml::I0, u64(0x123456789abcdef0));
+	UML_DADD(block, uml::I0, uml::I0, 0x1234);
+	save64(a64++);
+
+	UML_DMOV(block, uml::I0, u64(0x123456789abcdef0));
+	UML_DSUB(block, uml::I0, uml::I0, 0x1234);
+	save64(a64++);
+
+	UML_DMOV(block, uml::I0, u64(0xfedcba9876543210));
+	UML_DAND(block, uml::I0, uml::I0, u64(0x00ff00ff00ff00ff));
+	save64(a64++);
+
+	UML_DMOV(block, uml::I0, u64(0x923456789abcdef0));
+	UML_DSHL(block, uml::I0, uml::I0, 7);
+	save64(a64++);
+
+	UML_DMOV(block, uml::I0, u64(0xfedcba9876543210));
+	UML_DBFXU(block, uml::I0, uml::I0, 8, 16);
+	save64(a64++);
+
+	UML_DMOV(block, uml::I0, u64(0x0123456789abcdef));
+	UML_DROLAND(block, uml::I0, uml::I0, 20, u64(0x0000ffff00000000));
+	save64(a64++);
+
+	UML_DMOV(block, uml::I2, u64(0x123456789abcdef0));
+	UML_DMOV(block, uml::I3, u64(0x0fedcba987654321));
+	UML_DMULU(block, uml::I0, uml::I1, uml::I2, uml::I3);
+	save64(a64++);
+	save64_extra(a64 - 1);
+
+	UML_DMOV(block, uml::I0, u64(0x923456789abcdef0));
+	UML_DSHR(block, uml::I0, uml::I0, 9);
+	save64(a64++);
+
 	UML_EXIT(block, 0);
 	block.end();
 
@@ -396,6 +556,111 @@ void drc_condtest_state::machine_start()
 		}
 	}
 
+	{
+		auto const check_alu = [&](int index, u32 expected, char const *what)
+		{
+			if (m_alu_results[index] != expected)
+			{
+				osd_printf_error("drc_condtest: %s: expected %08x, got %08x\n",
+						what, expected, m_alu_results[index]);
+				errors++;
+			}
+		};
+		auto const check_alu_extra = [&](int index, u32 expected, char const *what)
+		{
+			if (m_alu_extra[index] != expected)
+			{
+				osd_printf_error("drc_condtest: %s: expected %08x, got %08x\n",
+						what, expected, m_alu_extra[index]);
+				errors++;
+			}
+		};
+		auto const bfxu = [](u32 src, u32 shift, u32 width)
+		{
+			return std::rotr(src, (shift + width) & 31) >> ((-int32_t(width)) & 31);
+		};
+		auto const bfxs = [](u32 src, u32 shift, u32 width)
+		{
+			return u32(int32_t(std::rotr(src, (shift + width) & 31)) >> ((-int32_t(width)) & 31));
+		};
+
+		check_alu(0, u32(0x12345678 + 0x123), "ADD immediate");
+		check_alu(1, u32(0x12345678 - 0x123), "SUB immediate");
+		check_alu(2, u32(0xdeadbeef & 0x7f), "AND 12-bit immediate");
+		check_alu(3, u32(0xdeadbeef & 0x00ff00ff), "AND wide immediate");
+		check_alu(4, u32(0x12345678 | 0x7f), "OR 12-bit immediate");
+		check_alu(5, u32(0xffffffff), "OR all ones");
+		check_alu(6, u32(0x12345678 ^ 0x7f), "XOR 12-bit immediate");
+		check_alu(7, u32(~0x12345678), "XOR all ones");
+		check_alu(8, u32(0x92345678) << 3, "SHL immediate");
+		check_alu(9, u32(0x92345678) >> 5, "SHR immediate");
+		check_alu(10, u32(int32_t(0x92345678) >> 7), "SAR immediate");
+		check_alu(11, std::rotr(u32(0x92345678), 9), "ROR immediate");
+		check_alu(12, std::rotl(u32(0x92345678), 11), "ROL immediate");
+		check_alu(13, bfxu(0xdeadbeef, 4, 8), "BFXU immediate");
+		check_alu(14, bfxu(0xdeadbeef, 28, 8), "BFXU wrapped");
+		check_alu(15, bfxs(0xdeadbeef, 4, 8), "BFXS immediate");
+		check_alu(16, bfxs(0xdeadbeef, 28, 8), "BFXS wrapped");
+		check_alu(17, std::rotl(u32(0xdeadbeef), 4) & 0x00ff0000, "ROLAND immediate");
+		check_alu(18, (0x11223344 & ~u32(0x00ff0000)) | (std::rotl(u32(0xdeadbeef), 4) & 0x00ff0000), "ROLINS immediate");
+
+		u64 const mulu = u64(0x12345678) * u64(0x9abcdef0);
+		check_alu(19, u32(mulu), "MULU low");
+		check_alu_extra(19, u32(mulu >> 32), "MULU high");
+		check_alu(20, u32(mulu), "MULULW");
+
+		s64 const muls = s64(int32_t(0x80000001)) * s64(int32_t(0x12345678));
+		check_alu(21, u32(muls), "MULS low");
+		check_alu_extra(21, u32(u64(muls) >> 32), "MULS high");
+
+		u32 const divu_q = 0x89abcdef / 0x00012345;
+		u32 const divu_r = 0x89abcdef % 0x00012345;
+		check_alu(22, divu_q, "DIVU quotient");
+		check_alu_extra(22, divu_r, "DIVU remainder");
+
+		int32_t const divs_a = int32_t(0xf9abcdef);
+		int32_t const divs_b = int32_t(0x00012345);
+		check_alu(23, u32(divs_a / divs_b), "DIVS quotient");
+		check_alu_extra(23, u32(divs_a % divs_b), "DIVS remainder");
+
+		auto const check_alu64 = [&](int index, u64 expected, char const *what)
+		{
+			if (m_alu64_results[index] != expected)
+			{
+				osd_printf_error("drc_condtest: %s: expected %016llx, got %016llx\n",
+						what, static_cast<unsigned long long>(expected),
+						static_cast<unsigned long long>(m_alu64_results[index]));
+				errors++;
+			}
+		};
+		auto const check_alu64_extra = [&](int index, u64 expected, char const *what)
+		{
+			if (m_alu64_extra[index] != expected)
+			{
+				osd_printf_error("drc_condtest: %s: expected %016llx, got %016llx\n",
+						what, static_cast<unsigned long long>(expected),
+						static_cast<unsigned long long>(m_alu64_extra[index]));
+				errors++;
+			}
+		};
+		auto const bfxu64 = [](u64 src, u32 shift, u32 width)
+		{
+			return std::rotr(src, (shift + width) & 63) >> ((-int32_t(width)) & 63);
+		};
+
+		check_alu64(0, u64(0x123456789abcdef0) + 0x1234, "64-bit ADD immediate");
+		check_alu64(1, u64(0x123456789abcdef0) - 0x1234, "64-bit SUB immediate");
+		check_alu64(2, u64(0xfedcba9876543210) & u64(0x00ff00ff00ff00ff), "64-bit AND immediate");
+		check_alu64(3, u64(0x923456789abcdef0) << 7, "64-bit SHL immediate");
+		check_alu64(4, bfxu64(0xfedcba9876543210, 8, 16), "64-bit BFXU immediate");
+		check_alu64(5, std::rotl(u64(0x0123456789abcdef), 20) & u64(0x0000ffff00000000), "64-bit ROLAND immediate");
+
+		unsigned __int128 const mulu64 = (unsigned __int128)u64(0x123456789abcdef0) * u64(0x0fedcba987654321);
+		check_alu64(6, u64(mulu64), "64-bit MULU low");
+		check_alu64_extra(6, u64(mulu64 >> 64), "64-bit MULU high");
+		check_alu64(7, u64(0x923456789abcdef0) >> 9, "64-bit SHR immediate");
+	}
+
 	if (m_cfg_result != 1)
 	{
 		osd_printf_error("drc_condtest: CFG liveness case: expected 1, got %u\n", m_cfg_result);
@@ -405,8 +670,8 @@ void drc_condtest_state::machine_start()
 	if (errors != 0)
 		throw emu_fatalerror("drc_condtest: %d condition/flag mismatch(es)\n", errors);
 
-	osd_printf_info("drc_condtest: PASS (%d conditions x %d flag combinations x 2 paths, %d CMP/TEST + branch cases)\n",
-			COND_COUNT, FLAG_COUNT, m_fusion_count);
+	osd_printf_info("drc_condtest: PASS (%d conditions x %d flag combinations x 2 paths, %d CMP/TEST + branch cases, %d ALU cases)\n",
+			COND_COUNT, FLAG_COUNT, m_fusion_count, ALU_RESULT_COUNT + ALU64_RESULT_COUNT);
 
 	machine().schedule_exit();
 }
