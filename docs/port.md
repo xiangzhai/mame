@@ -664,11 +664,11 @@ drc_specifictest: PASS (8 dword + 32 byte + 16 word reads, 8 dword + 8 narrow wr
 | FCSR/fmod 同步 | 已实现 | `near_state` 增加 `nominal_fmod`/`fmod_changed`，内存/helper 调用前后仅在 fmod 变化时同步；`SETFMOD` 相同值直接跳过 |
 | 基址寻址 | 已实现 | `$fp`（`BASE_REG`）用于 `m_state`/`m_near` 的 1 条 ld/st（12 位偏移），超出范围回退到 `la_la_local` |
 | 乘除法按需计算 | 已实现 | 仅当输出高位或 V flag 需要时才发 `mulh`；仅当需要余数时才发 `mod` |
-| move 同寄存器/写回 | 部分实现 | `mov_reg_param`/`mov_param_reg` 跳过 `src == dst`；`write_result` 统一处理零扩展和写回。通用 ALU 仍先写 `TEMP_REG3` 再 move |
+| move 同寄存器/写回 | 已实现 | 新增 `be_parameter::select_register()` 别名选择，通用整数 ALU 直接写入目标寄存器；`mov_reg_param`/`mov_param_reg`/`write_result` 统一处理零扩展和同寄存器写回 |
 | 浮点常量池 | 已实现 | `near_state` 缓存 `1.0f`/`1.0`，FRECIP/FRSQRT 不再每次重建 |
 | 条件移动 | 未实现（评估后保留） | `maskeqz/masknez` 需要 3 条 + 条件求值，通常不优于现有 branch-skip；x64 `cmov`/arm64 `csel` 是单条指令 |
-| flag 子集/延迟计算 | 未实现 | ADD/SUB/CMP 仍计算完整 C/V/Z/S；CFG 活性目前只用于 CMP/TEST 融合 |
-| FTOINT 跳表/FCMP | 未实现 | `ROUND_DEFAULT` 仍用 4 分支链；FCMP 仍用 3 条 `fcmp` 合成 C/Z/U |
+| flag 子集计算 | 已实现 | `emit_flags_nz/add/sub` 接受 `inst.flags()` 掩码，只计算请求的 Z/S/C/V；未请求的标志位保持不变，CFG 活性仍用于 CMP/TEST 融合 |
+| FTOINT/FCMP | 已实现 | `ROUND_DEFAULT` 直接用 FCSR 隐式舍入的 `ftint`；FCMP 去掉选择分支，并按 `inst.flags()` 只搬运需要的 C/Z/U |
 | indexed LOAD/STORE | 已实现 | 使用 `ldx/stx` 去掉 base+index 的额外 `add`；目标寄存器仍经 `TEMP_REG3` 中转 |
 | 固定生成缓冲区 | 未实现 | 仍按 `1024 B/指令` 预留，超出 `block.abort()`；asmjit 后端可增长/重试 |
 
@@ -684,9 +684,14 @@ drc_specifictest: PASS (8 dword + 32 byte + 16 word reads, 8 dword + 8 narrow wr
 - `READ/WRITE/FREAD/FWRITE/CALLC/DEBUG/RECOVER` 的 FCSR 同步改为先读 `m_near.fmod_changed`，为 0 时跳过前后两次 `emit_sync_fcsr()`；flag 寄存器在这些 opcode 中本来就会被修改，可安全用于条件判断。
 - `m_state` 和 `m_near` 的访问通过 `$fp` 基址 + 12 位偏移完成；偏移超出范围时回退原来的 `la_la_local`。`SAVE/RESTORE` 的冷寄存器路径也复用了该基址。
 
-#### 9.6.3 仍保留的差距
+#### 9.6.3 已实现的别名选择与标志位子集
 
-- 通用整数 ALU 仍固定先写 `TEMP_REG3` 再 move 到目标；要彻底消除需要引入 `dstp.select_register()` 风格的别名选择，并同步调整 flags 计算。
-- `ADD/SUB/CMP` 仍总是计算完整标志位；可按 `inst.flags()` 只算 Z/S/C/V 的子集，或做延迟标志位。
+- `be_parameter::select_register()` 在参数本身是寄存器时直接返回该寄存器，否则返回调用方提供的临时寄存器；ADD/SUB/AND/OR/XOR/SEXT/BFX/ROLAND/ROLINS/移位/位计数/乘除法/FTOINT/FCMP 均使用该别名，避免先写 `TEMP_REG3` 再回写目标。
+- `emit_flags_nz/add/sub` 接受 `inst.flags()` 掩码，只发射需要的 Z/S/C/V 计算；`merge_flags()` 仅更新掩码内的位，因此未请求的标志位不会被破坏。移位/旋转 count 为 0 时只更新 Z/S，保留 C。
+- FTOINT 的 `ROUND_DEFAULT` 不再展开 4 个舍入分支，而是直接使用按 FCSR 当前舍入模式执行的 `ftint.w/l`；源浮点寄存器和整数目标也通过 `select_register()` 直连。
+- FCMP 仍发 3 条比较以保持 NaN/异常语义，但去掉有序/无序选择分支，直接把 C/Z/U 移入所需位，并按 `inst.flags()` 省略未请求的 `movcf2gr`。
+
+#### 9.6.4 仍保留的差距
+
 - 条件移动没有改用 `maskeqz/masknez`，原因见上表：LoongArch 缺少单条 csel/cmov，3 条 mask/or 序列在多数情况下不优于可预测的分支。
-- FTOINT/FCMP 仍保留原实现；这些属于局部收益，优先级低于上述已落地项。
+- 固定生成缓冲区仍按 `1024 B/指令` 预留，超出时 `block.abort()`。

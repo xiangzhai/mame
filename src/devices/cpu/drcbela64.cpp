@@ -387,6 +387,10 @@ private:
 		la_fpr_t get_register_float(uint32_t regsize) const;
 		la_gpr_t get_register_int(uint32_t regsize) const;
 
+		// use the parameter's register when possible, otherwise the supplied default
+		la_fpr_t select_register(la_fpr_t defreg) const { return is_float_register() ? get_register_float(8) : defreg; }
+		la_gpr_t select_register(la_gpr_t defreg) const { return is_int_register() ? get_register_int(8) : defreg; }
+
 	private:
 		static inline constexpr int REG_MAX = 64;
 
@@ -471,9 +475,9 @@ private:
 	void emit_str_state_w(lagoon_assembler_t &a, la_gpr_t reg, const void *ptr) const;
 	void emit_str_state_d(lagoon_assembler_t &a, la_gpr_t reg, const void *ptr) const;
 
-	void emit_flags_nz(lagoon_assembler_t &a, la_gpr_t reg, int bits, la_gpr_t output);
-	void emit_flags_add(lagoon_assembler_t &a, la_gpr_t result, la_gpr_t src1, la_gpr_t src2, int bits, bool carryin);
-	void emit_flags_sub(lagoon_assembler_t &a, la_gpr_t result, la_gpr_t src1, la_gpr_t src2, int bits, bool borrowin);
+	void emit_flags_nz(lagoon_assembler_t &a, la_gpr_t reg, int bits, uint8_t mask, la_gpr_t output);
+	void emit_flags_add(lagoon_assembler_t &a, la_gpr_t result, la_gpr_t src1, la_gpr_t src2, int bits, bool carryin, uint8_t mask);
+	void emit_flags_sub(lagoon_assembler_t &a, la_gpr_t result, la_gpr_t src1, la_gpr_t src2, int bits, bool borrowin, uint8_t mask);
 	void merge_flags(lagoon_assembler_t &a, uint8_t mask);
 
 	void mov_float_reg_param(lagoon_assembler_t &a, uint32_t regsize, la_fpr_t dst, const be_parameter &src) const;
@@ -1160,75 +1164,118 @@ void drcbe_la64::emit_skip(lagoon_assembler_t &a, uml::condition_t cond, lagoon_
 	emit_flag_branch(a, cond, false, skip);
 }
 
-void drcbe_la64::emit_flags_nz(lagoon_assembler_t &a, la_gpr_t reg, int bits, la_gpr_t output)
+void drcbe_la64::emit_flags_nz(lagoon_assembler_t &a, la_gpr_t reg, int bits, uint8_t mask, la_gpr_t output)
 {
-	la_sltui(&a, output, reg, 1);
-	la_slli_d(&a, output, output, uml::FLAG_BIT_Z);
+	uint8_t const needed = mask & (uml::FLAG_Z | uml::FLAG_S);
+	if (!needed)
+	{
+		// the caller may add C/V below; make sure the accumulator starts clean
+		la_move(&a, output, LA_ZERO);
+		return;
+	}
 
-	la_srli_d(&a, SCRATCH_REG1, reg, bits - 1);
-	la_andi(&a, SCRATCH_REG1, SCRATCH_REG1, 1);
-	la_slli_d(&a, SCRATCH_REG1, SCRATCH_REG1, uml::FLAG_BIT_S);
-	la_or(&a, output, output, SCRATCH_REG1);
+	if (needed & uml::FLAG_Z)
+	{
+		la_sltui(&a, output, reg, 1);
+		la_slli_d(&a, output, output, uml::FLAG_BIT_Z);
+	}
+
+	if (needed & uml::FLAG_S)
+	{
+		if (needed & uml::FLAG_Z)
+		{
+			la_srli_d(&a, SCRATCH_REG1, reg, bits - 1);
+			la_andi(&a, SCRATCH_REG1, SCRATCH_REG1, 1);
+			la_slli_d(&a, SCRATCH_REG1, SCRATCH_REG1, uml::FLAG_BIT_S);
+			la_or(&a, output, output, SCRATCH_REG1);
+		}
+		else
+		{
+			la_srli_d(&a, output, reg, bits - 1);
+			la_andi(&a, output, output, 1);
+			la_slli_d(&a, output, output, uml::FLAG_BIT_S);
+		}
+	}
 }
 
-void drcbe_la64::emit_flags_add(lagoon_assembler_t &a, la_gpr_t result, la_gpr_t src1, la_gpr_t src2, int bits, bool carryin)
+void drcbe_la64::emit_flags_add(lagoon_assembler_t &a, la_gpr_t result, la_gpr_t src1, la_gpr_t src2, int bits, bool carryin, uint8_t mask)
 {
-	emit_flags_nz(a, result, bits, FLAG_TMP_REG);
+	uint8_t const needed = mask & (uml::FLAG_C | uml::FLAG_V | uml::FLAG_Z | uml::FLAG_S);
+	if (!needed)
+		return;
 
-	if (!carryin)
+	emit_flags_nz(a, result, bits, needed, FLAG_TMP_REG);
+
+	if (needed & uml::FLAG_C)
 	{
-		la_sltu(&a, SCRATCH_REG1, result, src1);
+		if (!carryin)
+		{
+			la_sltu(&a, SCRATCH_REG1, result, src1);
+		}
+		else
+		{
+			la_and(&a, SCRATCH_REG1, src1, src2);
+			la_or(&a, SCRATCH_REG2, src1, src2);
+			la_nor(&a, LA_T3, result, LA_ZERO);
+			la_and(&a, LA_T3, LA_T3, SCRATCH_REG2);
+			la_or(&a, SCRATCH_REG1, SCRATCH_REG1, LA_T3);
+			la_srli_d(&a, SCRATCH_REG1, SCRATCH_REG1, bits - 1);
+			la_andi(&a, SCRATCH_REG1, SCRATCH_REG1, 1);
+		}
+		la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, SCRATCH_REG1);
 	}
-	else
+
+	if (needed & uml::FLAG_V)
 	{
-		la_and(&a, SCRATCH_REG1, src1, src2);
-		la_or(&a, SCRATCH_REG2, src1, src2);
-		la_nor(&a, LA_T3, result, LA_ZERO);
-		la_and(&a, LA_T3, LA_T3, SCRATCH_REG2);
-		la_or(&a, SCRATCH_REG1, SCRATCH_REG1, LA_T3);
+		la_xor(&a, SCRATCH_REG1, src1, src2);
+		la_nor(&a, SCRATCH_REG1, SCRATCH_REG1, LA_ZERO);
+		la_xor(&a, SCRATCH_REG2, src1, result);
+		la_and(&a, SCRATCH_REG1, SCRATCH_REG1, SCRATCH_REG2);
 		la_srli_d(&a, SCRATCH_REG1, SCRATCH_REG1, bits - 1);
 		la_andi(&a, SCRATCH_REG1, SCRATCH_REG1, 1);
+		la_slli_d(&a, SCRATCH_REG1, SCRATCH_REG1, uml::FLAG_BIT_V);
+		la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, SCRATCH_REG1);
 	}
-	la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, SCRATCH_REG1);
-
-	la_xor(&a, SCRATCH_REG1, src1, src2);
-	la_nor(&a, SCRATCH_REG1, SCRATCH_REG1, LA_ZERO);
-	la_xor(&a, SCRATCH_REG2, src1, result);
-	la_and(&a, SCRATCH_REG1, SCRATCH_REG1, SCRATCH_REG2);
-	la_srli_d(&a, SCRATCH_REG1, SCRATCH_REG1, bits - 1);
-	la_andi(&a, SCRATCH_REG1, SCRATCH_REG1, 1);
-	la_slli_d(&a, SCRATCH_REG1, SCRATCH_REG1, uml::FLAG_BIT_V);
-	la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, SCRATCH_REG1);
 }
 
-void drcbe_la64::emit_flags_sub(lagoon_assembler_t &a, la_gpr_t result, la_gpr_t src1, la_gpr_t src2, int bits, bool borrowin)
+void drcbe_la64::emit_flags_sub(lagoon_assembler_t &a, la_gpr_t result, la_gpr_t src1, la_gpr_t src2, int bits, bool borrowin, uint8_t mask)
 {
-	emit_flags_nz(a, result, bits, FLAG_TMP_REG);
+	uint8_t const needed = mask & (uml::FLAG_C | uml::FLAG_V | uml::FLAG_Z | uml::FLAG_S);
+	if (!needed)
+		return;
 
-	if (!borrowin)
+	emit_flags_nz(a, result, bits, needed, FLAG_TMP_REG);
+
+	if (needed & uml::FLAG_C)
 	{
-		la_sltu(&a, SCRATCH_REG1, src1, src2);
+		if (!borrowin)
+		{
+			la_sltu(&a, SCRATCH_REG1, src1, src2);
+		}
+		else
+		{
+			la_nor(&a, SCRATCH_REG1, src1, LA_ZERO);
+			la_and(&a, SCRATCH_REG1, SCRATCH_REG1, src2);
+			la_nor(&a, SCRATCH_REG2, src1, LA_ZERO);
+			la_or(&a, SCRATCH_REG2, SCRATCH_REG2, src2);
+			la_and(&a, LA_T3, result, SCRATCH_REG2);
+			la_or(&a, SCRATCH_REG1, SCRATCH_REG1, LA_T3);
+			la_srli_d(&a, SCRATCH_REG1, SCRATCH_REG1, bits - 1);
+			la_andi(&a, SCRATCH_REG1, SCRATCH_REG1, 1);
+		}
+		la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, SCRATCH_REG1);
 	}
-	else
+
+	if (needed & uml::FLAG_V)
 	{
-		la_nor(&a, SCRATCH_REG1, src1, LA_ZERO);
-		la_and(&a, SCRATCH_REG1, SCRATCH_REG1, src2);
-		la_nor(&a, SCRATCH_REG2, src1, LA_ZERO);
-		la_or(&a, SCRATCH_REG2, SCRATCH_REG2, src2);
-		la_and(&a, LA_T3, result, SCRATCH_REG2);
-		la_or(&a, SCRATCH_REG1, SCRATCH_REG1, LA_T3);
+		la_xor(&a, SCRATCH_REG1, src1, src2);
+		la_xor(&a, SCRATCH_REG2, src1, result);
+		la_and(&a, SCRATCH_REG1, SCRATCH_REG1, SCRATCH_REG2);
 		la_srli_d(&a, SCRATCH_REG1, SCRATCH_REG1, bits - 1);
 		la_andi(&a, SCRATCH_REG1, SCRATCH_REG1, 1);
+		la_slli_d(&a, SCRATCH_REG1, SCRATCH_REG1, uml::FLAG_BIT_V);
+		la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, SCRATCH_REG1);
 	}
-	la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, SCRATCH_REG1);
-
-	la_xor(&a, SCRATCH_REG1, src1, src2);
-	la_xor(&a, SCRATCH_REG2, src1, result);
-	la_and(&a, SCRATCH_REG1, SCRATCH_REG1, SCRATCH_REG2);
-	la_srli_d(&a, SCRATCH_REG1, SCRATCH_REG1, bits - 1);
-	la_andi(&a, SCRATCH_REG1, SCRATCH_REG1, 1);
-	la_slli_d(&a, SCRATCH_REG1, SCRATCH_REG1, uml::FLAG_BIT_V);
-	la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, SCRATCH_REG1);
 }
 
 void drcbe_la64::merge_flags(lagoon_assembler_t &a, uint8_t mask)
@@ -3187,7 +3234,7 @@ void drcbe_la64::op_sext(lagoon_assembler_t &a, const uml::instruction &inst)
 	assert(sizep.is_size());
 	const auto size = sizep.size();
 
-	la_gpr_t const dst = TEMP_REG3;
+	la_gpr_t const dst = dstp.select_register(TEMP_REG3);
 
 	if ((1 << size) >= inst.size())
 	{
@@ -3195,8 +3242,8 @@ void drcbe_la64::op_sext(lagoon_assembler_t &a, const uml::instruction &inst)
 		if (inst.flags())
 		{
 			mov_reg_param(a, inst.size(), dst, dstp);
-			emit_flags_nz(a, dst, inst.size() * 8, FLAG_TMP_REG);
-			merge_flags(a, FLAG_Z | FLAG_S);
+			emit_flags_nz(a, dst, inst.size() * 8, inst.flags(), FLAG_TMP_REG);
+			merge_flags(a, inst.flags());
 		}
 		return;
 	}
@@ -3249,12 +3296,12 @@ void drcbe_la64::op_sext(lagoon_assembler_t &a, const uml::instruction &inst)
 	if (inst.size() == 4)
 		zero_extend32(a, dst);
 
-	mov_param_reg(a, inst.size(), dstp, dst);
+	write_result(a, inst.size(), dstp, dst, inst.size() == 4);
 
 	if (inst.flags())
 	{
-		emit_flags_nz(a, dst, inst.size() * 8, FLAG_TMP_REG);
-		merge_flags(a, FLAG_Z | FLAG_S);
+		emit_flags_nz(a, dst, inst.size() * 8, inst.flags(), FLAG_TMP_REG);
+		merge_flags(a, inst.flags());
 	}
 }
 
@@ -3276,46 +3323,47 @@ void drcbe_la64::op_bfxu(lagoon_assembler_t &a, const uml::instruction &inst)
 		uint32_t const width = uint32_t(widthp.immediate()) & (bits - 1);
 
 		mov_reg_param(a, inst.size(), TEMP_REG1, srcp);
+		la_gpr_t const result = dstp.select_register(TEMP_REG3);
 
 		if ((shift + width) <= bits)
 		{
 			if (width == 0)
 			{
 				if (inst.size() == 4)
-					la_rotri_w(&a, TEMP_REG3, TEMP_REG1, shift);
+					la_rotri_w(&a, result, TEMP_REG1, shift);
 				else
-					la_rotri_d(&a, TEMP_REG3, TEMP_REG1, shift);
+					la_rotri_d(&a, result, TEMP_REG1, shift);
 			}
 			else if (inst.size() == 4)
 			{
-				la_bstrpick_w(&a, TEMP_REG3, TEMP_REG1, shift + width - 1, shift);
+				la_bstrpick_w(&a, result, TEMP_REG1, shift + width - 1, shift);
 			}
 			else
 			{
-				la_bstrpick_d(&a, TEMP_REG3, TEMP_REG1, shift + width - 1, shift);
+				la_bstrpick_d(&a, result, TEMP_REG1, shift + width - 1, shift);
 			}
 		}
 		else
 		{
 			if (inst.size() == 4)
 			{
-				la_rotri_w(&a, TEMP_REG3, TEMP_REG1, shift);
-				la_bstrpick_w(&a, TEMP_REG3, TEMP_REG3, width - 1, 0);
+				la_rotri_w(&a, result, TEMP_REG1, shift);
+				la_bstrpick_w(&a, result, result, width - 1, 0);
 			}
 			else
 			{
-				la_rotri_d(&a, TEMP_REG3, TEMP_REG1, shift);
-				la_bstrpick_d(&a, TEMP_REG3, TEMP_REG3, width - 1, 0);
+				la_rotri_d(&a, result, TEMP_REG1, shift);
+				la_bstrpick_d(&a, result, result, width - 1, 0);
 			}
 		}
 
 		if (inst.size() == 4)
-			zero_extend32(a, TEMP_REG3);
-		write_result(a, inst.size(), dstp, TEMP_REG3, inst.size() == 4);
+			zero_extend32(a, result);
+		write_result(a, inst.size(), dstp, result, inst.size() == 4);
 		if (inst.flags())
 		{
-			emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
-			merge_flags(a, FLAG_Z | FLAG_S);
+			emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+			merge_flags(a, inst.flags());
 		}
 		return;
 	}
@@ -3325,28 +3373,29 @@ void drcbe_la64::op_bfxu(lagoon_assembler_t &a, const uml::instruction &inst)
 	mov_reg_param(a, 4, TEMP_REG3, widthp);
 	la_andi(&a, TEMP_REG2, TEMP_REG2, bits - 1);
 	la_andi(&a, TEMP_REG3, TEMP_REG3, bits - 1);
+	la_gpr_t const result = dstp.select_register(LA_T4);
 
 	la_add_d(&a, LA_T3, TEMP_REG2, TEMP_REG3);
 	la_andi(&a, LA_T3, LA_T3, bits - 1);
 	if (inst.size() == 4)
-		la_rotr_w(&a, LA_T4, TEMP_REG1, LA_T3);
+		la_rotr_w(&a, result, TEMP_REG1, LA_T3);
 	else
-		la_rotr_d(&a, LA_T4, TEMP_REG1, LA_T3);
+		la_rotr_d(&a, result, TEMP_REG1, LA_T3);
 
 	la_sub_d(&a, LA_T3, LA_ZERO, TEMP_REG3);
 	la_andi(&a, LA_T3, LA_T3, bits - 1);
 	if (inst.size() == 4)
-		la_srl_w(&a, LA_T4, LA_T4, LA_T3);
+		la_srl_w(&a, result, result, LA_T3);
 	else
-		la_srl_d(&a, LA_T4, LA_T4, LA_T3);
+		la_srl_d(&a, result, result, LA_T3);
 	if (inst.size() == 4)
-		zero_extend32(a, LA_T4);
+		zero_extend32(a, result);
 
-	write_result(a, inst.size(), dstp, LA_T4, inst.size() == 4);
+	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 	if (inst.flags())
 	{
-		emit_flags_nz(a, LA_T4, bits, FLAG_TMP_REG);
-		merge_flags(a, FLAG_Z | FLAG_S);
+		emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+		merge_flags(a, inst.flags());
 	}
 }
 
@@ -3368,13 +3417,14 @@ void drcbe_la64::op_bfxs(lagoon_assembler_t &a, const uml::instruction &inst)
 		uint32_t const width = uint32_t(widthp.immediate()) & (bits - 1);
 
 		mov_reg_param(a, inst.size(), TEMP_REG1, srcp);
+		la_gpr_t const result = dstp.select_register(TEMP_REG3);
 
 		if (width == 0)
 		{
 			if (inst.size() == 4)
-				la_rotri_w(&a, TEMP_REG3, TEMP_REG1, shift);
+				la_rotri_w(&a, result, TEMP_REG1, shift);
 			else
-				la_rotri_d(&a, TEMP_REG3, TEMP_REG1, shift);
+				la_rotri_d(&a, result, TEMP_REG1, shift);
 		}
 		else if ((shift + width) <= bits)
 		{
@@ -3382,13 +3432,13 @@ void drcbe_la64::op_bfxs(lagoon_assembler_t &a, const uml::instruction &inst)
 			uint32_t const right = bits - width;
 			if (inst.size() == 4)
 			{
-				la_slli_w(&a, TEMP_REG3, TEMP_REG1, left);
-				la_srai_w(&a, TEMP_REG3, TEMP_REG3, right);
+				la_slli_w(&a, result, TEMP_REG1, left);
+				la_srai_w(&a, result, result, right);
 			}
 			else
 			{
-				la_slli_d(&a, TEMP_REG3, TEMP_REG1, left);
-				la_srai_d(&a, TEMP_REG3, TEMP_REG3, right);
+				la_slli_d(&a, result, TEMP_REG1, left);
+				la_srai_d(&a, result, result, right);
 			}
 		}
 		else
@@ -3396,25 +3446,25 @@ void drcbe_la64::op_bfxs(lagoon_assembler_t &a, const uml::instruction &inst)
 			uint32_t const n = bits - width;
 			if (inst.size() == 4)
 			{
-				la_rotri_w(&a, TEMP_REG3, TEMP_REG1, shift);
-				la_slli_w(&a, TEMP_REG3, TEMP_REG3, n);
-				la_srai_w(&a, TEMP_REG3, TEMP_REG3, n);
+				la_rotri_w(&a, result, TEMP_REG1, shift);
+				la_slli_w(&a, result, result, n);
+				la_srai_w(&a, result, result, n);
 			}
 			else
 			{
-				la_rotri_d(&a, TEMP_REG3, TEMP_REG1, shift);
-				la_slli_d(&a, TEMP_REG3, TEMP_REG3, n);
-				la_srai_d(&a, TEMP_REG3, TEMP_REG3, n);
+				la_rotri_d(&a, result, TEMP_REG1, shift);
+				la_slli_d(&a, result, result, n);
+				la_srai_d(&a, result, result, n);
 			}
 		}
 
 		if (inst.size() == 4)
-			zero_extend32(a, TEMP_REG3);
-		write_result(a, inst.size(), dstp, TEMP_REG3, inst.size() == 4);
+			zero_extend32(a, result);
+		write_result(a, inst.size(), dstp, result, inst.size() == 4);
 		if (inst.flags())
 		{
-			emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
-			merge_flags(a, FLAG_Z | FLAG_S);
+			emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+			merge_flags(a, inst.flags());
 		}
 		return;
 	}
@@ -3424,28 +3474,29 @@ void drcbe_la64::op_bfxs(lagoon_assembler_t &a, const uml::instruction &inst)
 	mov_reg_param(a, 4, TEMP_REG3, widthp);
 	la_andi(&a, TEMP_REG2, TEMP_REG2, bits - 1);
 	la_andi(&a, TEMP_REG3, TEMP_REG3, bits - 1);
+	la_gpr_t const result = dstp.select_register(LA_T4);
 
 	la_add_d(&a, LA_T3, TEMP_REG2, TEMP_REG3);
 	la_andi(&a, LA_T3, LA_T3, bits - 1);
 	if (inst.size() == 4)
-		la_rotr_w(&a, LA_T4, TEMP_REG1, LA_T3);
+		la_rotr_w(&a, result, TEMP_REG1, LA_T3);
 	else
-		la_rotr_d(&a, LA_T4, TEMP_REG1, LA_T3);
+		la_rotr_d(&a, result, TEMP_REG1, LA_T3);
 
 	la_sub_d(&a, LA_T3, LA_ZERO, TEMP_REG3);
 	la_andi(&a, LA_T3, LA_T3, bits - 1);
 	if (inst.size() == 4)
-		la_sra_w(&a, LA_T4, LA_T4, LA_T3);
+		la_sra_w(&a, result, result, LA_T3);
 	else
-		la_sra_d(&a, LA_T4, LA_T4, LA_T3);
+		la_sra_d(&a, result, result, LA_T3);
 	if (inst.size() == 4)
-		zero_extend32(a, LA_T4);
+		zero_extend32(a, result);
 
-	write_result(a, inst.size(), dstp, LA_T4, inst.size() == 4);
+	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 	if (inst.flags())
 	{
-		emit_flags_nz(a, LA_T4, bits, FLAG_TMP_REG);
-		merge_flags(a, FLAG_Z | FLAG_S);
+		emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+		merge_flags(a, inst.flags());
 	}
 }
 
@@ -3466,53 +3517,51 @@ void drcbe_la64::op_roland(lagoon_assembler_t &a, const uml::instruction &inst)
 		uint32_t const shift = uint32_t(shiftp.immediate()) & (bits - 1);
 		uint64_t const mask = (inst.size() == 4) ? uint64_t(uint32_t(maskp.immediate())) : maskp.immediate();
 
-		mov_reg_param(a, inst.size(), TEMP_REG1, srcp);
-
-		la_gpr_t result = TEMP_REG1;
-		if (shift != 0)
-		{
-			uint32_t const rotate = (bits - shift) & (bits - 1);
-			if (inst.size() == 4)
-				la_rotri_w(&a, TEMP_REG3, TEMP_REG1, rotate);
-			else
-				la_rotri_d(&a, TEMP_REG3, TEMP_REG1, rotate);
-			result = TEMP_REG3;
-		}
+		la_gpr_t const result = dstp.select_register(TEMP_REG3);
 
 		if (mask == 0)
 		{
-			la_move(&a, TEMP_REG3, LA_ZERO);
-			result = TEMP_REG3;
+			la_move(&a, result, LA_ZERO);
 		}
-		else if (mask != size_mask(inst.size()))
+		else
 		{
-			if (is_logic_imm12(mask, inst.size()))
+			mov_reg_param(a, inst.size(), result, srcp);
+			if (shift != 0)
 			{
-				la_andi(&a, TEMP_REG3, result, int32_t(uint32_t(mask)));
-				result = TEMP_REG3;
-			}
-			else if (is_contiguous_mask(mask, inst.size()))
-			{
-				unsigned const lsb = std::countr_zero(mask);
-				unsigned const width = std::popcount(mask);
+				uint32_t const rotate = (bits - shift) & (bits - 1);
 				if (inst.size() == 4)
-					la_bstrpick_w(&a, TEMP_REG3, result, lsb + width - 1, lsb);
+					la_rotri_w(&a, result, result, rotate);
 				else
-					la_bstrpick_d(&a, TEMP_REG3, result, lsb + width - 1, lsb);
-				if (lsb)
-				{
-					if (inst.size() == 4)
-						la_slli_w(&a, TEMP_REG3, TEMP_REG3, lsb);
-					else
-						la_slli_d(&a, TEMP_REG3, TEMP_REG3, lsb);
-				}
-				result = TEMP_REG3;
+					la_rotri_d(&a, result, result, rotate);
 			}
-			else
+
+			if (mask != size_mask(inst.size()))
 			{
-				mov_reg_param(a, inst.size(), LA_T5, maskp);
-				la_and(&a, TEMP_REG3, result, LA_T5);
-				result = TEMP_REG3;
+				if (is_logic_imm12(mask, inst.size()))
+				{
+					la_andi(&a, result, result, int32_t(uint32_t(mask)));
+				}
+				else if (is_contiguous_mask(mask, inst.size()))
+				{
+					unsigned const lsb = std::countr_zero(mask);
+					unsigned const width = std::popcount(mask);
+					if (inst.size() == 4)
+						la_bstrpick_w(&a, result, result, lsb + width - 1, lsb);
+					else
+						la_bstrpick_d(&a, result, result, lsb + width - 1, lsb);
+					if (lsb)
+					{
+						if (inst.size() == 4)
+							la_slli_w(&a, result, result, lsb);
+						else
+							la_slli_d(&a, result, result, lsb);
+					}
+				}
+				else
+				{
+					mov_reg_param(a, inst.size(), LA_T5, maskp);
+					la_and(&a, result, result, LA_T5);
+				}
 			}
 		}
 
@@ -3521,8 +3570,8 @@ void drcbe_la64::op_roland(lagoon_assembler_t &a, const uml::instruction &inst)
 		write_result(a, inst.size(), dstp, result, inst.size() == 4);
 		if (inst.flags())
 		{
-			emit_flags_nz(a, result, bits, FLAG_TMP_REG);
-			merge_flags(a, FLAG_Z | FLAG_S);
+			emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+			merge_flags(a, inst.flags());
 		}
 		return;
 	}
@@ -3531,20 +3580,21 @@ void drcbe_la64::op_roland(lagoon_assembler_t &a, const uml::instruction &inst)
 	mov_reg_param(a, 4, TEMP_REG2, shiftp);
 	la_andi(&a, TEMP_REG2, TEMP_REG2, bits - 1);
 	la_sub_d(&a, LA_T3, LA_ZERO, TEMP_REG2);
-	if (inst.size() == 4)
-		la_rotr_w(&a, LA_T4, TEMP_REG1, LA_T3);
-	else
-		la_rotr_d(&a, LA_T4, TEMP_REG1, LA_T3);
 	mov_reg_param(a, inst.size(), LA_T5, maskp);
-	la_and(&a, LA_T4, LA_T4, LA_T5);
+	la_gpr_t const result = dstp.select_register(LA_T4);
 	if (inst.size() == 4)
-		zero_extend32(a, LA_T4);
+		la_rotr_w(&a, result, TEMP_REG1, LA_T3);
+	else
+		la_rotr_d(&a, result, TEMP_REG1, LA_T3);
+	la_and(&a, result, result, LA_T5);
+	if (inst.size() == 4)
+		zero_extend32(a, result);
 
-	write_result(a, inst.size(), dstp, LA_T4, inst.size() == 4);
+	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 	if (inst.flags())
 	{
-		emit_flags_nz(a, LA_T4, bits, FLAG_TMP_REG);
-		merge_flags(a, FLAG_Z | FLAG_S);
+		emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+		merge_flags(a, inst.flags());
 	}
 }
 
@@ -3565,8 +3615,8 @@ void drcbe_la64::op_rolins(lagoon_assembler_t &a, const uml::instruction &inst)
 		uint32_t const shift = uint32_t(shiftp.immediate()) & (bits - 1);
 		uint64_t const mask = (inst.size() == 4) ? uint64_t(uint32_t(maskp.immediate())) : maskp.immediate();
 
-		mov_reg_param(a, inst.size(), TEMP_REG1, dstp);
-		la_gpr_t result = TEMP_REG1;
+		la_gpr_t const result = dstp.select_register(TEMP_REG1);
+		mov_reg_param(a, inst.size(), result, dstp);
 
 		if (mask != 0)
 		{
@@ -3585,7 +3635,7 @@ void drcbe_la64::op_rolins(lagoon_assembler_t &a, const uml::instruction &inst)
 
 			if (mask == size_mask(inst.size()))
 			{
-				result = rotated;
+				la_move(&a, result, rotated);
 			}
 			else if (is_contiguous_mask(mask, inst.size()))
 			{
@@ -3596,18 +3646,16 @@ void drcbe_la64::op_rolins(lagoon_assembler_t &a, const uml::instruction &inst)
 				else
 					la_bstrpick_d(&a, TEMP_REG3, rotated, lsb + width - 1, lsb);
 				if (inst.size() == 4)
-					la_bstrins_w(&a, TEMP_REG1, TEMP_REG3, lsb + width - 1, lsb);
+					la_bstrins_w(&a, result, TEMP_REG3, lsb + width - 1, lsb);
 				else
-					la_bstrins_d(&a, TEMP_REG1, TEMP_REG3, lsb + width - 1, lsb);
-				result = TEMP_REG1;
+					la_bstrins_d(&a, result, TEMP_REG3, lsb + width - 1, lsb);
 			}
 			else
 			{
 				mov_reg_param(a, inst.size(), LA_T5, maskp);
 				la_and(&a, TEMP_REG3, rotated, LA_T5);
-				la_andn(&a, TEMP_REG1, TEMP_REG1, LA_T5);
-				la_or(&a, TEMP_REG1, TEMP_REG1, TEMP_REG3);
-				result = TEMP_REG1;
+				la_andn(&a, result, result, LA_T5);
+				la_or(&a, result, result, TEMP_REG3);
 			}
 		}
 
@@ -3616,17 +3664,18 @@ void drcbe_la64::op_rolins(lagoon_assembler_t &a, const uml::instruction &inst)
 		write_result(a, inst.size(), dstp, result, inst.size() == 4);
 		if (inst.flags())
 		{
-			emit_flags_nz(a, result, bits, FLAG_TMP_REG);
-			merge_flags(a, FLAG_Z | FLAG_S);
+			emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+			merge_flags(a, inst.flags());
 		}
 		return;
 	}
 
-	mov_reg_param(a, inst.size(), TEMP_REG1, dstp);
-	mov_reg_param(a, inst.size(), TEMP_REG2, srcp);
 	mov_reg_param(a, 4, TEMP_REG3, shiftp);
 	la_andi(&a, TEMP_REG3, TEMP_REG3, bits - 1);
 	la_sub_d(&a, LA_T3, LA_ZERO, TEMP_REG3);
+	mov_reg_param(a, inst.size(), TEMP_REG2, srcp);
+	la_gpr_t const result = dstp.select_register(TEMP_REG1);
+	mov_reg_param(a, inst.size(), result, dstp);
 	if (inst.size() == 4)
 		la_rotr_w(&a, LA_T4, TEMP_REG2, LA_T3);
 	else
@@ -3634,16 +3683,16 @@ void drcbe_la64::op_rolins(lagoon_assembler_t &a, const uml::instruction &inst)
 	mov_reg_param(a, inst.size(), LA_T5, maskp);
 	la_and(&a, LA_T4, LA_T4, LA_T5);
 	la_nor(&a, LA_T6, LA_T5, LA_ZERO);
-	la_and(&a, TEMP_REG1, TEMP_REG1, LA_T6);
-	la_or(&a, TEMP_REG1, TEMP_REG1, LA_T4);
+	la_and(&a, result, result, LA_T6);
+	la_or(&a, result, result, LA_T4);
 	if (inst.size() == 4)
-		zero_extend32(a, TEMP_REG1);
+		zero_extend32(a, result);
 
-	write_result(a, inst.size(), dstp, TEMP_REG1, inst.size() == 4);
+	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 	if (inst.flags())
 	{
-		emit_flags_nz(a, TEMP_REG1, bits, FLAG_TMP_REG);
-		merge_flags(a, FLAG_Z | FLAG_S);
+		emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+		merge_flags(a, inst.flags());
 	}
 }
 
@@ -3674,15 +3723,14 @@ template <bool CarryIn> void drcbe_la64::op_add(lagoon_assembler_t &a, const uml
 					: int64_t(src2p.immediate());
 			if (is_simm12(imm))
 			{
-				mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
-				la_gpr_t result = TEMP_REG1;
+				la_gpr_t const result = dstp.select_register(TEMP_REG1);
+				mov_reg_param(a, inst.size(), result, src1p);
 				if (imm != 0)
 				{
 					if (inst.size() == 4)
-						la_addi_w(&a, TEMP_REG3, TEMP_REG1, int32_t(imm));
+						la_addi_w(&a, result, result, int32_t(imm));
 					else
-						la_addi_d(&a, TEMP_REG3, TEMP_REG1, int32_t(imm));
-					result = TEMP_REG3;
+						la_addi_d(&a, result, result, int32_t(imm));
 				}
 				write_result(a, inst.size(), dstp, result);
 				return;
@@ -3692,31 +3740,32 @@ template <bool CarryIn> void drcbe_la64::op_add(lagoon_assembler_t &a, const uml
 
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
 	mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
+	la_gpr_t const result = dstp.select_register(TEMP_REG3);
 
 	if (inst.size() == 4)
 	{
-		la_add_w(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-		zero_extend32(a, TEMP_REG3);
+		la_add_w(&a, result, TEMP_REG1, TEMP_REG2);
+		zero_extend32(a, result);
 	}
 	else
 	{
-		la_add_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+		la_add_d(&a, result, TEMP_REG1, TEMP_REG2);
 	}
 
 	if (CarryIn)
 	{
 		la_andi(&a, LA_T3, FLAGS_REG, uml::FLAG_C);
-		la_add_d(&a, TEMP_REG3, TEMP_REG3, LA_T3);
+		la_add_d(&a, result, result, LA_T3);
 		if (inst.size() == 4)
-			zero_extend32(a, TEMP_REG3);
+			zero_extend32(a, result);
 	}
 
-	mov_param_reg(a, inst.size(), dstp, TEMP_REG3);
+	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 
 	if (inst.flags())
 	{
-		emit_flags_add(a, TEMP_REG3, TEMP_REG1, TEMP_REG2, bits, CarryIn);
-		merge_flags(a, FLAG_C | FLAG_V | FLAG_Z | FLAG_S);
+		emit_flags_add(a, result, TEMP_REG1, TEMP_REG2, bits, CarryIn, inst.flags());
+		merge_flags(a, inst.flags());
 	}
 }
 
@@ -3747,15 +3796,14 @@ template <bool CarryIn> void drcbe_la64::op_sub(lagoon_assembler_t &a, const uml
 			if ((imm >= -2047) && (imm <= 2048))
 			{
 				int64_t const neg = -imm;
-				mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
-				la_gpr_t result = TEMP_REG1;
+				la_gpr_t const result = dstp.select_register(TEMP_REG1);
+				mov_reg_param(a, inst.size(), result, src1p);
 				if (neg != 0)
 				{
 					if (inst.size() == 4)
-						la_addi_w(&a, TEMP_REG3, TEMP_REG1, int32_t(neg));
+						la_addi_w(&a, result, result, int32_t(neg));
 					else
-						la_addi_d(&a, TEMP_REG3, TEMP_REG1, int32_t(neg));
-					result = TEMP_REG3;
+						la_addi_d(&a, result, result, int32_t(neg));
 				}
 				write_result(a, inst.size(), dstp, result);
 				return;
@@ -3765,31 +3813,32 @@ template <bool CarryIn> void drcbe_la64::op_sub(lagoon_assembler_t &a, const uml
 
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
 	mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
+	la_gpr_t const result = dstp.select_register(TEMP_REG3);
 
 	if (inst.size() == 4)
 	{
-		la_sub_w(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-		zero_extend32(a, TEMP_REG3);
+		la_sub_w(&a, result, TEMP_REG1, TEMP_REG2);
+		zero_extend32(a, result);
 	}
 	else
 	{
-		la_sub_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+		la_sub_d(&a, result, TEMP_REG1, TEMP_REG2);
 	}
 
 	if (CarryIn)
 	{
 		la_andi(&a, LA_T3, FLAGS_REG, uml::FLAG_C);
-		la_sub_d(&a, TEMP_REG3, TEMP_REG3, LA_T3);
+		la_sub_d(&a, result, result, LA_T3);
 		if (inst.size() == 4)
-			zero_extend32(a, TEMP_REG3);
+			zero_extend32(a, result);
 	}
 
-	mov_param_reg(a, inst.size(), dstp, TEMP_REG3);
+	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 
 	if (inst.flags())
 	{
-		emit_flags_sub(a, TEMP_REG3, TEMP_REG1, TEMP_REG2, bits, CarryIn);
-		merge_flags(a, FLAG_C | FLAG_V | FLAG_Z | FLAG_S);
+		emit_flags_sub(a, result, TEMP_REG1, TEMP_REG2, bits, CarryIn, inst.flags());
+		merge_flags(a, inst.flags());
 	}
 }
 
@@ -3814,7 +3863,7 @@ void drcbe_la64::op_cmp(lagoon_assembler_t &a, const uml::instruction &inst)
 				? compute_sub_flags(src1p.immediate(), src2p.immediate(), inst.size())
 				: uint8_t(FLAG_Z);
 		load_imm32(a, FLAG_TMP_REG, value);
-		merge_flags(a, FLAG_C | FLAG_V | FLAG_Z | FLAG_S);
+		merge_flags(a, inst.flags());
 		return;
 	}
 
@@ -3831,8 +3880,8 @@ void drcbe_la64::op_cmp(lagoon_assembler_t &a, const uml::instruction &inst)
 		la_sub_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
 	}
 
-	emit_flags_sub(a, TEMP_REG3, TEMP_REG1, TEMP_REG2, bits, false);
-	merge_flags(a, FLAG_C | FLAG_V | FLAG_Z | FLAG_S);
+	emit_flags_sub(a, TEMP_REG3, TEMP_REG1, TEMP_REG2, bits, false, inst.flags());
+	merge_flags(a, inst.flags());
 }
 
 void drcbe_la64::op_and(lagoon_assembler_t &a, const uml::instruction &inst)
@@ -3847,27 +3896,27 @@ void drcbe_la64::op_and(lagoon_assembler_t &a, const uml::instruction &inst)
 	const int bits = inst.size() * 8;
 
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
+	la_gpr_t const result = dstp.select_register(TEMP_REG3);
 
-	la_gpr_t result = TEMP_REG3;
 	if (src2p.is_immediate())
 	{
 		uint64_t const imm = (inst.size() == 4) ? uint64_t(uint32_t(src2p.immediate())) : src2p.immediate();
 		if (imm == 0)
-			la_move(&a, TEMP_REG3, LA_ZERO);
+			la_move(&a, result, LA_ZERO);
 		else if (imm == size_mask(inst.size()))
-			result = TEMP_REG1;
+			la_move(&a, result, TEMP_REG1);
 		else if (is_logic_imm12(imm, inst.size()))
-			la_andi(&a, TEMP_REG3, TEMP_REG1, int32_t(uint32_t(imm)));
+			la_andi(&a, result, TEMP_REG1, int32_t(uint32_t(imm)));
 		else
 		{
 			mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
-			la_and(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+			la_and(&a, result, TEMP_REG1, TEMP_REG2);
 		}
 	}
 	else
 	{
 		mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
-		la_and(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+		la_and(&a, result, TEMP_REG1, TEMP_REG2);
 	}
 
 	if (inst.size() == 4)
@@ -3875,8 +3924,8 @@ void drcbe_la64::op_and(lagoon_assembler_t &a, const uml::instruction &inst)
 	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 	if (inst.flags())
 	{
-		emit_flags_nz(a, result, bits, FLAG_TMP_REG);
-		merge_flags(a, FLAG_Z | FLAG_S);
+		emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+		merge_flags(a, inst.flags());
 	}
 }
 
@@ -3900,7 +3949,7 @@ void drcbe_la64::op_test(lagoon_assembler_t &a, const uml::instruction &inst)
 				(src1p.is_immediate() && src2p.is_immediate()) ? (src1p.immediate() & src2p.immediate()) : 0,
 				inst.size());
 		load_imm32(a, FLAG_TMP_REG, value);
-		merge_flags(a, FLAG_Z | FLAG_S);
+		merge_flags(a, inst.flags());
 		return;
 	}
 
@@ -3934,8 +3983,8 @@ void drcbe_la64::op_test(lagoon_assembler_t &a, const uml::instruction &inst)
 
 	if (inst.size() == 4)
 		zero_extend32(a, result);
-	emit_flags_nz(a, result, bits, FLAG_TMP_REG);
-	merge_flags(a, FLAG_Z | FLAG_S);
+	emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+	merge_flags(a, inst.flags());
 }
 
 void drcbe_la64::op_or(lagoon_assembler_t &a, const uml::instruction &inst)
@@ -3950,27 +3999,27 @@ void drcbe_la64::op_or(lagoon_assembler_t &a, const uml::instruction &inst)
 	const int bits = inst.size() * 8;
 
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
+	la_gpr_t const result = dstp.select_register(TEMP_REG3);
 
-	la_gpr_t result = TEMP_REG3;
 	if (src2p.is_immediate())
 	{
 		uint64_t const imm = (inst.size() == 4) ? uint64_t(uint32_t(src2p.immediate())) : src2p.immediate();
 		if (imm == 0)
-			result = TEMP_REG1;
+			la_move(&a, result, TEMP_REG1);
 		else if (imm == size_mask(inst.size()))
-			la_addi_d(&a, TEMP_REG3, LA_ZERO, -1);
+			la_addi_d(&a, result, LA_ZERO, -1);
 		else if (is_logic_imm12(imm, inst.size()))
-			la_ori(&a, TEMP_REG3, TEMP_REG1, int32_t(uint32_t(imm)));
+			la_ori(&a, result, TEMP_REG1, int32_t(uint32_t(imm)));
 		else
 		{
 			mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
-			la_or(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+			la_or(&a, result, TEMP_REG1, TEMP_REG2);
 		}
 	}
 	else
 	{
 		mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
-		la_or(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+		la_or(&a, result, TEMP_REG1, TEMP_REG2);
 	}
 
 	if (inst.size() == 4)
@@ -3978,8 +4027,8 @@ void drcbe_la64::op_or(lagoon_assembler_t &a, const uml::instruction &inst)
 	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 	if (inst.flags())
 	{
-		emit_flags_nz(a, result, bits, FLAG_TMP_REG);
-		merge_flags(a, FLAG_Z | FLAG_S);
+		emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+		merge_flags(a, inst.flags());
 	}
 }
 
@@ -3995,27 +4044,27 @@ void drcbe_la64::op_xor(lagoon_assembler_t &a, const uml::instruction &inst)
 	const int bits = inst.size() * 8;
 
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
+	la_gpr_t const result = dstp.select_register(TEMP_REG3);
 
-	la_gpr_t result = TEMP_REG3;
 	if (src2p.is_immediate())
 	{
 		uint64_t const imm = (inst.size() == 4) ? uint64_t(uint32_t(src2p.immediate())) : src2p.immediate();
 		if (imm == 0)
-			result = TEMP_REG1;
+			la_move(&a, result, TEMP_REG1);
 		else if (imm == size_mask(inst.size()))
-			la_nor(&a, TEMP_REG3, TEMP_REG1, LA_ZERO);
+			la_nor(&a, result, TEMP_REG1, LA_ZERO);
 		else if (is_logic_imm12(imm, inst.size()))
-			la_xori(&a, TEMP_REG3, TEMP_REG1, int32_t(uint32_t(imm)));
+			la_xori(&a, result, TEMP_REG1, int32_t(uint32_t(imm)));
 		else
 		{
 			mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
-			la_xor(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+			la_xor(&a, result, TEMP_REG1, TEMP_REG2);
 		}
 	}
 	else
 	{
 		mov_reg_param(a, inst.size(), TEMP_REG2, src2p);
-		la_xor(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+		la_xor(&a, result, TEMP_REG1, TEMP_REG2);
 	}
 
 	if (inst.size() == 4)
@@ -4023,8 +4072,8 @@ void drcbe_la64::op_xor(lagoon_assembler_t &a, const uml::instruction &inst)
 	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 	if (inst.flags())
 	{
-		emit_flags_nz(a, result, bits, FLAG_TMP_REG);
-		merge_flags(a, FLAG_Z | FLAG_S);
+		emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+		merge_flags(a, inst.flags());
 	}
 }
 
@@ -4039,16 +4088,17 @@ void drcbe_la64::op_lzcnt(lagoon_assembler_t &a, const uml::instruction &inst)
 	const int bits = inst.size() * 8;
 
 	mov_reg_param(a, inst.size(), TEMP_REG1, srcp);
+	la_gpr_t const result = dstp.select_register(TEMP_REG3);
 	if (inst.size() == 4)
-		la_clz_w(&a, TEMP_REG3, TEMP_REG1);
+		la_clz_w(&a, result, TEMP_REG1);
 	else
-		la_clz_d(&a, TEMP_REG3, TEMP_REG1);
+		la_clz_d(&a, result, TEMP_REG1);
 
-	mov_param_reg(a, inst.size(), dstp, TEMP_REG3);
+	write_result(a, inst.size(), dstp, result);
 	if (inst.flags())
 	{
-		emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
-		merge_flags(a, FLAG_Z | FLAG_S);
+		emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+		merge_flags(a, inst.flags());
 	}
 }
 
@@ -4063,19 +4113,20 @@ void drcbe_la64::op_tzcnt(lagoon_assembler_t &a, const uml::instruction &inst)
 	const int bits = inst.size() * 8;
 
 	mov_reg_param(a, inst.size(), TEMP_REG1, srcp);
+	la_gpr_t const result = dstp.select_register(TEMP_REG3);
 	if (inst.size() == 4)
-		la_ctz_w(&a, TEMP_REG3, TEMP_REG1);
+		la_ctz_w(&a, result, TEMP_REG1);
 	else
-		la_ctz_d(&a, TEMP_REG3, TEMP_REG1);
+		la_ctz_d(&a, result, TEMP_REG1);
 
-	mov_param_reg(a, inst.size(), dstp, TEMP_REG3);
+	write_result(a, inst.size(), dstp, result);
 	if (inst.flags())
 	{
 		load_imm32(a, TEMP_REG2, bits);
-		la_xor(&a, TEMP_REG2, TEMP_REG3, TEMP_REG2);
+		la_xor(&a, TEMP_REG2, result, TEMP_REG2);
 		la_sltui(&a, FLAG_TMP_REG, TEMP_REG2, 1);
 		la_slli_d(&a, FLAG_TMP_REG, FLAG_TMP_REG, uml::FLAG_BIT_Z);
-		merge_flags(a, FLAG_Z | FLAG_S);
+		merge_flags(a, inst.flags());
 	}
 }
 
@@ -4090,21 +4141,22 @@ void drcbe_la64::op_bswap(lagoon_assembler_t &a, const uml::instruction &inst)
 	const int bits = inst.size() * 8;
 
 	mov_reg_param(a, inst.size(), TEMP_REG1, srcp);
+	la_gpr_t const result = dstp.select_register(TEMP_REG3);
 	if (inst.size() == 4)
 	{
-		la_revb_2w(&a, TEMP_REG3, TEMP_REG1);
-		zero_extend32(a, TEMP_REG3);
+		la_revb_2w(&a, result, TEMP_REG1);
+		zero_extend32(a, result);
 	}
 	else
 	{
-		la_revb_d(&a, TEMP_REG3, TEMP_REG1);
+		la_revb_d(&a, result, TEMP_REG1);
 	}
 
-	mov_param_reg(a, inst.size(), dstp, TEMP_REG3);
+	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 	if (inst.flags())
 	{
-		emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
-		merge_flags(a, FLAG_Z | FLAG_S);
+		emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+		merge_flags(a, inst.flags());
 	}
 }
 
@@ -4127,55 +4179,60 @@ template <int Opcode> void drcbe_la64::op_shift(lagoon_assembler_t &a, const uml
 		if (shift == 0)
 		{
 			write_result(a, inst.size(), dstp, TEMP_REG1, true);
-			if (inst.flags())
+			uint8_t const nzmask = inst.flags() & (uml::FLAG_Z | uml::FLAG_S);
+			if (nzmask)
 			{
-				emit_flags_nz(a, TEMP_REG1, bits, FLAG_TMP_REG);
-				merge_flags(a, FLAG_Z | FLAG_S);
+				emit_flags_nz(a, TEMP_REG1, bits, nzmask, FLAG_TMP_REG);
+				merge_flags(a, nzmask);
 			}
 			return;
 		}
 
+		la_gpr_t const result = dstp.select_register(TEMP_REG3);
 		if (Opcode == 0)
 		{
 			if (inst.size() == 4)
-				la_slli_w(&a, TEMP_REG3, TEMP_REG1, shift);
+				la_slli_w(&a, result, TEMP_REG1, shift);
 			else
-				la_slli_d(&a, TEMP_REG3, TEMP_REG1, shift);
+				la_slli_d(&a, result, TEMP_REG1, shift);
 		}
 		else if (Opcode == 1)
 		{
 			if (inst.size() == 4)
-				la_srli_w(&a, TEMP_REG3, TEMP_REG1, shift);
+				la_srli_w(&a, result, TEMP_REG1, shift);
 			else
-				la_srli_d(&a, TEMP_REG3, TEMP_REG1, shift);
+				la_srli_d(&a, result, TEMP_REG1, shift);
 		}
 		else if (Opcode == 2)
 		{
 			if (inst.size() == 4)
-				la_srai_w(&a, TEMP_REG3, TEMP_REG1, shift);
+				la_srai_w(&a, result, TEMP_REG1, shift);
 			else
-				la_srai_d(&a, TEMP_REG3, TEMP_REG1, shift);
+				la_srai_d(&a, result, TEMP_REG1, shift);
 		}
 		else
 		{
 			if (inst.size() == 4)
-				la_rotri_w(&a, TEMP_REG3, TEMP_REG1, shift);
+				la_rotri_w(&a, result, TEMP_REG1, shift);
 			else
-				la_rotri_d(&a, TEMP_REG3, TEMP_REG1, shift);
+				la_rotri_d(&a, result, TEMP_REG1, shift);
 		}
 
 		if (inst.size() == 4)
-			zero_extend32(a, TEMP_REG3);
-		write_result(a, inst.size(), dstp, TEMP_REG3, inst.size() == 4);
+			zero_extend32(a, result);
+		write_result(a, inst.size(), dstp, result, inst.size() == 4);
 
 		if (inst.flags())
 		{
-			emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
-			int const carrybit = (Opcode == 0) ? (bits - shift) : (shift - 1);
-			la_srli_d(&a, LA_T3, TEMP_REG1, carrybit);
-			la_andi(&a, LA_T3, LA_T3, 1);
-			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
-			merge_flags(a, FLAG_C | FLAG_Z | FLAG_S);
+			emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+			if (inst.flags() & uml::FLAG_C)
+			{
+				int const carrybit = (Opcode == 0) ? (bits - shift) : (shift - 1);
+				la_srli_d(&a, LA_T3, TEMP_REG1, carrybit);
+				la_andi(&a, LA_T3, LA_T3, 1);
+				la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
+			}
+			merge_flags(a, inst.flags());
 		}
 		return;
 	}
@@ -4183,39 +4240,40 @@ template <int Opcode> void drcbe_la64::op_shift(lagoon_assembler_t &a, const uml
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
 	mov_reg_param(a, 4, TEMP_REG2, src2p);
 	la_andi(&a, TEMP_REG2, TEMP_REG2, bits - 1);
+	la_gpr_t const result = dstp.select_register(TEMP_REG3);
 
 	if (Opcode == 0)
 	{
 		if (inst.size() == 4)
-			la_sll_w(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+			la_sll_w(&a, result, TEMP_REG1, TEMP_REG2);
 		else
-			la_sll_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+			la_sll_d(&a, result, TEMP_REG1, TEMP_REG2);
 	}
 	else if (Opcode == 1)
 	{
 		if (inst.size() == 4)
-			la_srl_w(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+			la_srl_w(&a, result, TEMP_REG1, TEMP_REG2);
 		else
-			la_srl_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+			la_srl_d(&a, result, TEMP_REG1, TEMP_REG2);
 	}
 	else if (Opcode == 2)
 	{
 		if (inst.size() == 4)
-			la_sra_w(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+			la_sra_w(&a, result, TEMP_REG1, TEMP_REG2);
 		else
-			la_sra_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+			la_sra_d(&a, result, TEMP_REG1, TEMP_REG2);
 	}
 	else
 	{
 		if (inst.size() == 4)
-			la_rotr_w(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+			la_rotr_w(&a, result, TEMP_REG1, TEMP_REG2);
 		else
-			la_rotr_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+			la_rotr_d(&a, result, TEMP_REG1, TEMP_REG2);
 	}
 	if (inst.size() == 4)
-		zero_extend32(a, TEMP_REG3);
+		zero_extend32(a, result);
 
-	mov_param_reg(a, inst.size(), dstp, TEMP_REG3);
+	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 
 	if (inst.flags())
 	{
@@ -4223,25 +4281,32 @@ template <int Opcode> void drcbe_la64::op_shift(lagoon_assembler_t &a, const uml
 		lagoon_label_t done = {};
 		la_bnez(&a, TEMP_REG2, la_label(&a, &nonzero));
 
-		emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
-		merge_flags(a, FLAG_Z | FLAG_S);
+		uint8_t const nzmask = inst.flags() & (uml::FLAG_Z | uml::FLAG_S);
+		if (nzmask)
+		{
+			emit_flags_nz(a, result, bits, nzmask, FLAG_TMP_REG);
+			merge_flags(a, nzmask);
+		}
 		la_b(&a, la_label(&a, &done));
 
 		la_bind(&a, &nonzero);
-		emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
-		if (Opcode == 0)
+		emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+		if (inst.flags() & uml::FLAG_C)
 		{
-			la_sub_d(&a, LA_T3, LA_ZERO, TEMP_REG2);
-			la_addi_d(&a, LA_T3, LA_T3, bits);
+			if (Opcode == 0)
+			{
+				la_sub_d(&a, LA_T3, LA_ZERO, TEMP_REG2);
+				la_addi_d(&a, LA_T3, LA_T3, bits);
+			}
+			else
+			{
+				la_addi_d(&a, LA_T3, TEMP_REG2, -1);
+			}
+			la_srl_d(&a, LA_T3, TEMP_REG1, LA_T3);
+			la_andi(&a, LA_T3, LA_T3, 1);
+			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
 		}
-		else
-		{
-			la_addi_d(&a, LA_T3, TEMP_REG2, -1);
-		}
-		la_srl_d(&a, LA_T3, TEMP_REG1, LA_T3);
-		la_andi(&a, LA_T3, LA_T3, 1);
-		la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
-		merge_flags(a, FLAG_C | FLAG_Z | FLAG_S);
+		merge_flags(a, inst.flags());
 
 		la_bind(&a, &done);
 		la_label_free(&a, &nonzero);
@@ -4268,31 +4333,36 @@ void drcbe_la64::op_rol(lagoon_assembler_t &a, const uml::instruction &inst)
 		if (shift == 0)
 		{
 			write_result(a, inst.size(), dstp, TEMP_REG1, true);
-			if (inst.flags())
+			uint8_t const nzmask = inst.flags() & (uml::FLAG_Z | uml::FLAG_S);
+			if (nzmask)
 			{
-				emit_flags_nz(a, TEMP_REG1, bits, FLAG_TMP_REG);
-				merge_flags(a, FLAG_Z | FLAG_S);
+				emit_flags_nz(a, TEMP_REG1, bits, nzmask, FLAG_TMP_REG);
+				merge_flags(a, nzmask);
 			}
 			return;
 		}
 
 		uint32_t const rotate = (bits - shift) & (bits - 1);
+		la_gpr_t const result = dstp.select_register(TEMP_REG3);
 		if (inst.size() == 4)
-			la_rotri_w(&a, TEMP_REG3, TEMP_REG1, rotate);
+			la_rotri_w(&a, result, TEMP_REG1, rotate);
 		else
-			la_rotri_d(&a, TEMP_REG3, TEMP_REG1, rotate);
+			la_rotri_d(&a, result, TEMP_REG1, rotate);
 
 		if (inst.size() == 4)
-			zero_extend32(a, TEMP_REG3);
-		write_result(a, inst.size(), dstp, TEMP_REG3, inst.size() == 4);
+			zero_extend32(a, result);
+		write_result(a, inst.size(), dstp, result, inst.size() == 4);
 
 		if (inst.flags())
 		{
-			emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
-			la_srli_d(&a, LA_T3, TEMP_REG1, bits - shift);
-			la_andi(&a, LA_T3, LA_T3, 1);
-			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
-			merge_flags(a, FLAG_C | FLAG_Z | FLAG_S);
+			emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+			if (inst.flags() & uml::FLAG_C)
+			{
+				la_srli_d(&a, LA_T3, TEMP_REG1, bits - shift);
+				la_andi(&a, LA_T3, LA_T3, 1);
+				la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
+			}
+			merge_flags(a, inst.flags());
 		}
 		return;
 	}
@@ -4301,14 +4371,15 @@ void drcbe_la64::op_rol(lagoon_assembler_t &a, const uml::instruction &inst)
 	mov_reg_param(a, 4, TEMP_REG2, src2p);
 	la_andi(&a, TEMP_REG2, TEMP_REG2, bits - 1);
 	la_sub_d(&a, LA_T3, LA_ZERO, TEMP_REG2);
+	la_gpr_t const result = dstp.select_register(TEMP_REG3);
 	if (inst.size() == 4)
-		la_rotr_w(&a, TEMP_REG3, TEMP_REG1, LA_T3);
+		la_rotr_w(&a, result, TEMP_REG1, LA_T3);
 	else
-		la_rotr_d(&a, TEMP_REG3, TEMP_REG1, LA_T3);
+		la_rotr_d(&a, result, TEMP_REG1, LA_T3);
 	if (inst.size() == 4)
-		zero_extend32(a, TEMP_REG3);
+		zero_extend32(a, result);
 
-	write_result(a, inst.size(), dstp, TEMP_REG3, inst.size() == 4);
+	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 
 	if (inst.flags())
 	{
@@ -4316,18 +4387,25 @@ void drcbe_la64::op_rol(lagoon_assembler_t &a, const uml::instruction &inst)
 		lagoon_label_t done = {};
 		la_bnez(&a, TEMP_REG2, la_label(&a, &nonzero));
 
-		emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
-		merge_flags(a, FLAG_Z | FLAG_S);
+		uint8_t const nzmask = inst.flags() & (uml::FLAG_Z | uml::FLAG_S);
+		if (nzmask)
+		{
+			emit_flags_nz(a, result, bits, nzmask, FLAG_TMP_REG);
+			merge_flags(a, nzmask);
+		}
 		la_b(&a, la_label(&a, &done));
 
 		la_bind(&a, &nonzero);
-		emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
-		la_sub_d(&a, LA_T3, LA_ZERO, TEMP_REG2);
-		la_addi_d(&a, LA_T3, LA_T3, bits);
-		la_srl_d(&a, LA_T3, TEMP_REG1, LA_T3);
-		la_andi(&a, LA_T3, LA_T3, 1);
-		la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
-		merge_flags(a, FLAG_C | FLAG_Z | FLAG_S);
+		emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+		if (inst.flags() & uml::FLAG_C)
+		{
+			la_sub_d(&a, LA_T3, LA_ZERO, TEMP_REG2);
+			la_addi_d(&a, LA_T3, LA_T3, bits);
+			la_srl_d(&a, LA_T3, TEMP_REG1, LA_T3);
+			la_andi(&a, LA_T3, LA_T3, 1);
+			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
+		}
+		merge_flags(a, inst.flags());
 
 		la_bind(&a, &done);
 		la_label_free(&a, &nonzero);
@@ -4349,6 +4427,7 @@ void drcbe_la64::op_rolc(lagoon_assembler_t &a, const uml::instruction &inst)
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
 	mov_reg_param(a, 4, TEMP_REG2, src2p);
 	la_andi(&a, TEMP_REG2, TEMP_REG2, bits - 1);
+	la_gpr_t const result = dstp.select_register(TEMP_REG3);
 
 	lagoon_label_t zero = {};
 	lagoon_label_t one = {};
@@ -4370,44 +4449,60 @@ void drcbe_la64::op_rolc(lagoon_assembler_t &a, const uml::instruction &inst)
 	la_sub_d(&a, LA_T3, LA_ZERO, TEMP_REG2);
 	la_addi_d(&a, LA_T3, LA_T3, bits + 1);
 	la_srl_d(&a, LA_T3, TEMP_REG1, LA_T3);
-	la_or(&a, TEMP_REG3, LA_T4, LA_T3);
+	la_or(&a, result, LA_T4, LA_T3);
 	if (inst.size() == 4)
-		zero_extend32(a, TEMP_REG3);
+		zero_extend32(a, result);
 
-	emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
-	la_sub_d(&a, LA_T3, LA_ZERO, TEMP_REG2);
-	la_addi_d(&a, LA_T3, LA_T3, bits);
-	la_srl_d(&a, LA_T3, TEMP_REG1, LA_T3);
-	la_andi(&a, LA_T3, LA_T3, 1);
-	la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
-	merge_flags(a, FLAG_C | FLAG_Z | FLAG_S);
+	if (inst.flags())
+	{
+		emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+		if (inst.flags() & uml::FLAG_C)
+		{
+			la_sub_d(&a, LA_T3, LA_ZERO, TEMP_REG2);
+			la_addi_d(&a, LA_T3, LA_T3, bits);
+			la_srl_d(&a, LA_T3, TEMP_REG1, LA_T3);
+			la_andi(&a, LA_T3, LA_T3, 1);
+			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
+		}
+		merge_flags(a, inst.flags());
+	}
 	la_b(&a, la_label(&a, &done));
 
 	if (bits == 64)
 	{
 		la_bind(&a, &one);
 		la_andi(&a, LA_T3, FLAGS_REG, uml::FLAG_C);
-		la_slli_d(&a, TEMP_REG3, TEMP_REG1, 1);
-		la_or(&a, TEMP_REG3, TEMP_REG3, LA_T3);
-		emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
-		la_srli_d(&a, LA_T3, TEMP_REG1, 63);
-		la_andi(&a, LA_T3, LA_T3, 1);
-		la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
-		merge_flags(a, FLAG_C | FLAG_Z | FLAG_S);
+		la_slli_d(&a, result, TEMP_REG1, 1);
+		la_or(&a, result, result, LA_T3);
+		if (inst.flags())
+		{
+			emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+			if (inst.flags() & uml::FLAG_C)
+			{
+				la_srli_d(&a, LA_T3, TEMP_REG1, 63);
+				la_andi(&a, LA_T3, LA_T3, 1);
+				la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
+			}
+			merge_flags(a, inst.flags());
+		}
 		la_b(&a, la_label(&a, &done));
 	}
 
 	la_bind(&a, &zero);
-	la_move(&a, TEMP_REG3, TEMP_REG1);
-	emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
-	merge_flags(a, FLAG_Z | FLAG_S);
+	la_move(&a, result, TEMP_REG1);
+	uint8_t const nzmask = inst.flags() & (uml::FLAG_Z | uml::FLAG_S);
+	if (nzmask)
+	{
+		emit_flags_nz(a, result, bits, nzmask, FLAG_TMP_REG);
+		merge_flags(a, nzmask);
+	}
 
 	la_bind(&a, &done);
 	la_label_free(&a, &zero);
 	la_label_free(&a, &one);
 	la_label_free(&a, &done);
 
-	mov_param_reg(a, inst.size(), dstp, TEMP_REG3);
+	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 }
 
 void drcbe_la64::op_rorc(lagoon_assembler_t &a, const uml::instruction &inst)
@@ -4424,6 +4519,7 @@ void drcbe_la64::op_rorc(lagoon_assembler_t &a, const uml::instruction &inst)
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
 	mov_reg_param(a, 4, TEMP_REG2, src2p);
 	la_andi(&a, TEMP_REG2, TEMP_REG2, bits - 1);
+	la_gpr_t const result = dstp.select_register(TEMP_REG3);
 
 	lagoon_label_t zero = {};
 	lagoon_label_t one = {};
@@ -4446,43 +4542,59 @@ void drcbe_la64::op_rorc(lagoon_assembler_t &a, const uml::instruction &inst)
 	la_sub_d(&a, LA_T3, LA_ZERO, TEMP_REG2);
 	la_addi_d(&a, LA_T3, LA_T3, bits + 1);
 	la_sll_d(&a, LA_T3, TEMP_REG1, LA_T3);
-	la_or(&a, TEMP_REG3, LA_T4, LA_T3);
+	la_or(&a, result, LA_T4, LA_T3);
 	if (inst.size() == 4)
-		zero_extend32(a, TEMP_REG3);
+		zero_extend32(a, result);
 
-	emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
-	la_addi_d(&a, LA_T3, TEMP_REG2, -1);
-	la_srl_d(&a, LA_T3, TEMP_REG1, LA_T3);
-	la_andi(&a, LA_T3, LA_T3, 1);
-	la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
-	merge_flags(a, FLAG_C | FLAG_Z | FLAG_S);
+	if (inst.flags())
+	{
+		emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+		if (inst.flags() & uml::FLAG_C)
+		{
+			la_addi_d(&a, LA_T3, TEMP_REG2, -1);
+			la_srl_d(&a, LA_T3, TEMP_REG1, LA_T3);
+			la_andi(&a, LA_T3, LA_T3, 1);
+			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
+		}
+		merge_flags(a, inst.flags());
+	}
 	la_b(&a, la_label(&a, &done));
 
 	if (bits == 64)
 	{
 		la_bind(&a, &one);
 		la_andi(&a, LA_T3, FLAGS_REG, uml::FLAG_C);
-		la_srli_d(&a, TEMP_REG3, TEMP_REG1, 1);
+		la_srli_d(&a, result, TEMP_REG1, 1);
 		la_slli_d(&a, LA_T3, LA_T3, 63);
-		la_or(&a, TEMP_REG3, TEMP_REG3, LA_T3);
-		emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
-		la_andi(&a, LA_T3, TEMP_REG1, 1);
-		la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
-		merge_flags(a, FLAG_C | FLAG_Z | FLAG_S);
+		la_or(&a, result, result, LA_T3);
+		if (inst.flags())
+		{
+			emit_flags_nz(a, result, bits, inst.flags(), FLAG_TMP_REG);
+			if (inst.flags() & uml::FLAG_C)
+			{
+				la_andi(&a, LA_T3, TEMP_REG1, 1);
+				la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T3);
+			}
+			merge_flags(a, inst.flags());
+		}
 		la_b(&a, la_label(&a, &done));
 	}
 
 	la_bind(&a, &zero);
-	la_move(&a, TEMP_REG3, TEMP_REG1);
-	emit_flags_nz(a, TEMP_REG3, bits, FLAG_TMP_REG);
-	merge_flags(a, FLAG_Z | FLAG_S);
+	la_move(&a, result, TEMP_REG1);
+	uint8_t const nzmask = inst.flags() & (uml::FLAG_Z | uml::FLAG_S);
+	if (nzmask)
+	{
+		emit_flags_nz(a, result, bits, nzmask, FLAG_TMP_REG);
+		merge_flags(a, nzmask);
+	}
 
 	la_bind(&a, &done);
 	la_label_free(&a, &zero);
 	la_label_free(&a, &one);
 	la_label_free(&a, &done);
 
-	mov_param_reg(a, inst.size(), dstp, TEMP_REG3);
+	write_result(a, inst.size(), dstp, result, inst.size() == 4);
 }
 
 
@@ -4504,50 +4616,53 @@ void drcbe_la64::op_mulu(lagoon_assembler_t &a, const uml::instruction &inst)
 	if (inst.size() == 4)
 	{
 		la_mul_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-		la_bstrpick_d(&a, LA_T3, TEMP_REG3, 31, 0);
-
-		mov_param_reg(a, 4, dstp, LA_T3);
+		la_gpr_t const low = dstp.select_register(LA_T3);
+		la_bstrpick_d(&a, low, TEMP_REG3, 31, 0);
+		write_result(a, 4, dstp, low, true);
 		if (compute_hi)
 		{
-			la_srli_d(&a, LA_T4, TEMP_REG3, 32);
-			mov_param_reg(a, 4, edstp, LA_T4);
+			la_gpr_t const high = edstp.select_register(LA_T4);
+			la_srli_d(&a, high, TEMP_REG3, 32);
+			write_result(a, 4, edstp, high, true);
 		}
 
 		if (inst.flags())
 		{
-			emit_flags_nz(a, TEMP_REG3, 64, FLAG_TMP_REG);
+			emit_flags_nz(a, TEMP_REG3, 64, inst.flags(), FLAG_TMP_REG);
 			la_srli_d(&a, LA_T6, TEMP_REG3, 32);
 			la_sltui(&a, LA_T6, LA_T6, 1);
 			la_xori(&a, LA_T6, LA_T6, 1);
 			la_slli_d(&a, LA_T6, LA_T6, uml::FLAG_BIT_V);
 			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T6);
-			merge_flags(a, FLAG_V | FLAG_Z | FLAG_S);
+			merge_flags(a, inst.flags());
 		}
 	}
 	else
 	{
-		la_mul_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+		la_gpr_t const low = dstp.select_register(TEMP_REG3);
+		la_gpr_t const high = compute_hi ? edstp.select_register(LA_T3) : LA_T3;
+		la_mul_d(&a, low, TEMP_REG1, TEMP_REG2);
 		if (compute_hi || inst.flags())
-			la_mulh_du(&a, LA_T3, TEMP_REG1, TEMP_REG2);
+			la_mulh_du(&a, high, TEMP_REG1, TEMP_REG2);
 
-		mov_param_reg(a, 8, dstp, TEMP_REG3);
+		write_result(a, 8, dstp, low);
 		if (compute_hi)
-			mov_param_reg(a, 8, edstp, LA_T3);
+			write_result(a, 8, edstp, high);
 
 		if (inst.flags())
 		{
-			la_or(&a, LA_T4, TEMP_REG3, LA_T3);
-			emit_flags_nz(a, LA_T4, 64, FLAG_TMP_REG);
-			la_srli_d(&a, LA_T4, LA_T3, 63);
+			la_or(&a, LA_T4, low, high);
+			emit_flags_nz(a, LA_T4, 64, inst.flags(), FLAG_TMP_REG);
+			la_srli_d(&a, LA_T4, high, 63);
 			la_andi(&a, LA_T4, LA_T4, 1);
 			la_slli_d(&a, LA_T4, LA_T4, uml::FLAG_BIT_S);
 			la_andi(&a, FLAG_TMP_REG, FLAG_TMP_REG, ~(uml::FLAG_S));
 			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T4);
-			la_sltui(&a, LA_T4, LA_T3, 1);
+			la_sltui(&a, LA_T4, high, 1);
 			la_xori(&a, LA_T4, LA_T4, 1);
 			la_slli_d(&a, LA_T4, LA_T4, uml::FLAG_BIT_V);
 			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T4);
-			merge_flags(a, FLAG_V | FLAG_Z | FLAG_S);
+			merge_flags(a, inst.flags());
 		}
 	}
 }
@@ -4568,35 +4683,37 @@ void drcbe_la64::op_mululw(lagoon_assembler_t &a, const uml::instruction &inst)
 	if (inst.size() == 4)
 	{
 		la_mul_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-		la_bstrpick_d(&a, LA_T3, TEMP_REG3, 31, 0);
-		mov_param_reg(a, 4, dstp, LA_T3);
+		la_gpr_t const low = dstp.select_register(LA_T3);
+		la_bstrpick_d(&a, low, TEMP_REG3, 31, 0);
+		write_result(a, 4, dstp, low, true);
 
 		if (inst.flags())
 		{
-			emit_flags_nz(a, LA_T3, 32, FLAG_TMP_REG);
+			emit_flags_nz(a, low, 32, inst.flags(), FLAG_TMP_REG);
 			la_srli_d(&a, LA_T6, TEMP_REG3, 32);
 			la_sltui(&a, LA_T6, LA_T6, 1);
 			la_xori(&a, LA_T6, LA_T6, 1);
 			la_slli_d(&a, LA_T6, LA_T6, uml::FLAG_BIT_V);
 			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T6);
-			merge_flags(a, FLAG_V | FLAG_Z | FLAG_S);
+			merge_flags(a, inst.flags());
 		}
 	}
 	else
 	{
-		la_mul_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+		la_gpr_t const low = dstp.select_register(TEMP_REG3);
+		la_mul_d(&a, low, TEMP_REG1, TEMP_REG2);
 		if (inst.flags() & FLAG_V)
 			la_mulh_du(&a, LA_T3, TEMP_REG1, TEMP_REG2);
-		mov_param_reg(a, 8, dstp, TEMP_REG3);
+		write_result(a, 8, dstp, low);
 
 		if (inst.flags())
 		{
-			emit_flags_nz(a, TEMP_REG3, 64, FLAG_TMP_REG);
+			emit_flags_nz(a, low, 64, inst.flags(), FLAG_TMP_REG);
 			la_sltui(&a, LA_T6, LA_T3, 1);
 			la_xori(&a, LA_T6, LA_T6, 1);
 			la_slli_d(&a, LA_T6, LA_T6, uml::FLAG_BIT_V);
 			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T6);
-			merge_flags(a, FLAG_V | FLAG_Z | FLAG_S);
+			merge_flags(a, inst.flags());
 		}
 	}
 }
@@ -4621,18 +4738,19 @@ void drcbe_la64::op_muls(lagoon_assembler_t &a, const uml::instruction &inst)
 		sign_extend32(a, TEMP_REG1);
 		sign_extend32(a, TEMP_REG2);
 		la_mul_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-		la_bstrpick_d(&a, LA_T3, TEMP_REG3, 31, 0);
-
-		mov_param_reg(a, 4, dstp, LA_T3);
+		la_gpr_t const low = dstp.select_register(LA_T3);
+		la_bstrpick_d(&a, low, TEMP_REG3, 31, 0);
+		write_result(a, 4, dstp, low, true);
 		if (compute_hi)
 		{
-			la_srli_d(&a, LA_T4, TEMP_REG3, 32);
-			mov_param_reg(a, 4, edstp, LA_T4);
+			la_gpr_t const high = edstp.select_register(LA_T4);
+			la_srli_d(&a, high, TEMP_REG3, 32);
+			write_result(a, 4, edstp, high, true);
 		}
 
 		if (inst.flags())
 		{
-			emit_flags_nz(a, TEMP_REG3, 64, FLAG_TMP_REG);
+			emit_flags_nz(a, TEMP_REG3, 64, inst.flags(), FLAG_TMP_REG);
 			la_slli_d(&a, LA_T6, TEMP_REG3, 32);
 			la_srai_d(&a, LA_T6, LA_T6, 32);
 			la_xor(&a, LA_T6, LA_T6, TEMP_REG3);
@@ -4640,35 +4758,37 @@ void drcbe_la64::op_muls(lagoon_assembler_t &a, const uml::instruction &inst)
 			la_xori(&a, LA_T6, LA_T6, 1);
 			la_slli_d(&a, LA_T6, LA_T6, uml::FLAG_BIT_V);
 			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T6);
-			merge_flags(a, FLAG_V | FLAG_Z | FLAG_S);
+			merge_flags(a, inst.flags());
 		}
 	}
 	else
 	{
-		la_mul_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+		la_gpr_t const low = dstp.select_register(TEMP_REG3);
+		la_gpr_t const high = compute_hi ? edstp.select_register(LA_T3) : LA_T3;
+		la_mul_d(&a, low, TEMP_REG1, TEMP_REG2);
 		if (compute_hi || inst.flags())
-			la_mulh_d(&a, LA_T3, TEMP_REG1, TEMP_REG2);
+			la_mulh_d(&a, high, TEMP_REG1, TEMP_REG2);
 
-		mov_param_reg(a, 8, dstp, TEMP_REG3);
+		write_result(a, 8, dstp, low);
 		if (compute_hi)
-			mov_param_reg(a, 8, edstp, LA_T3);
+			write_result(a, 8, edstp, high);
 
 		if (inst.flags())
 		{
-			la_or(&a, LA_T4, TEMP_REG3, LA_T3);
-			emit_flags_nz(a, LA_T4, 64, FLAG_TMP_REG);
-			la_srli_d(&a, LA_T4, LA_T3, 63);
+			la_or(&a, LA_T4, low, high);
+			emit_flags_nz(a, LA_T4, 64, inst.flags(), FLAG_TMP_REG);
+			la_srli_d(&a, LA_T4, high, 63);
 			la_andi(&a, LA_T4, LA_T4, 1);
 			la_slli_d(&a, LA_T4, LA_T4, uml::FLAG_BIT_S);
 			la_andi(&a, FLAG_TMP_REG, FLAG_TMP_REG, ~(uml::FLAG_S));
 			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T4);
-			la_srai_d(&a, LA_T4, TEMP_REG3, 63);
-			la_xor(&a, LA_T4, LA_T4, LA_T3);
+			la_srai_d(&a, LA_T4, low, 63);
+			la_xor(&a, LA_T4, LA_T4, high);
 			la_sltui(&a, LA_T4, LA_T4, 1);
 			la_xori(&a, LA_T4, LA_T4, 1);
 			la_slli_d(&a, LA_T4, LA_T4, uml::FLAG_BIT_V);
 			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T4);
-			merge_flags(a, FLAG_V | FLAG_Z | FLAG_S);
+			merge_flags(a, inst.flags());
 		}
 	}
 }
@@ -4691,12 +4811,13 @@ void drcbe_la64::op_mulslw(lagoon_assembler_t &a, const uml::instruction &inst)
 		sign_extend32(a, TEMP_REG1);
 		sign_extend32(a, TEMP_REG2);
 		la_mul_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
-		la_bstrpick_d(&a, LA_T3, TEMP_REG3, 31, 0);
-		mov_param_reg(a, 4, dstp, LA_T3);
+		la_gpr_t const low = dstp.select_register(LA_T3);
+		la_bstrpick_d(&a, low, TEMP_REG3, 31, 0);
+		write_result(a, 4, dstp, low, true);
 
 		if (inst.flags())
 		{
-			emit_flags_nz(a, LA_T3, 32, FLAG_TMP_REG);
+			emit_flags_nz(a, low, 32, inst.flags(), FLAG_TMP_REG);
 			la_slli_d(&a, LA_T6, TEMP_REG3, 32);
 			la_srai_d(&a, LA_T6, LA_T6, 32);
 			la_xor(&a, LA_T6, LA_T6, TEMP_REG3);
@@ -4704,26 +4825,27 @@ void drcbe_la64::op_mulslw(lagoon_assembler_t &a, const uml::instruction &inst)
 			la_xori(&a, LA_T6, LA_T6, 1);
 			la_slli_d(&a, LA_T6, LA_T6, uml::FLAG_BIT_V);
 			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T6);
-			merge_flags(a, FLAG_V | FLAG_Z | FLAG_S);
+			merge_flags(a, inst.flags());
 		}
 	}
 	else
 	{
-		la_mul_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+		la_gpr_t const low = dstp.select_register(TEMP_REG3);
+		la_mul_d(&a, low, TEMP_REG1, TEMP_REG2);
 		if (inst.flags() & FLAG_V)
 			la_mulh_d(&a, LA_T3, TEMP_REG1, TEMP_REG2);
-		mov_param_reg(a, 8, dstp, TEMP_REG3);
+		write_result(a, 8, dstp, low);
 
 		if (inst.flags())
 		{
-			emit_flags_nz(a, TEMP_REG3, 64, FLAG_TMP_REG);
-			la_srai_d(&a, LA_T4, TEMP_REG3, 63);
+			emit_flags_nz(a, low, 64, inst.flags(), FLAG_TMP_REG);
+			la_srai_d(&a, LA_T4, low, 63);
 			la_xor(&a, LA_T4, LA_T4, LA_T3);
 			la_sltui(&a, LA_T4, LA_T4, 1);
 			la_xori(&a, LA_T4, LA_T4, 1);
 			la_slli_d(&a, LA_T4, LA_T4, uml::FLAG_BIT_V);
 			la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, LA_T4);
-			merge_flags(a, FLAG_V | FLAG_Z | FLAG_S);
+			merge_flags(a, inst.flags());
 		}
 	}
 }
@@ -4747,49 +4869,51 @@ template <bool Signed> void drcbe_la64::op_div(lagoon_assembler_t &a, const uml:
 	la_beqz(&a, TEMP_REG2, la_label(&a, &zero));
 
 	mov_reg_param(a, inst.size(), TEMP_REG1, src1p);
+	la_gpr_t const quot = dstp.select_register(TEMP_REG3);
+	la_gpr_t const rem = edstp.select_register(LA_T3);
 
 	if (inst.size() == 4)
 	{
 		if (Signed)
 		{
-			la_div_w(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+			la_div_w(&a, quot, TEMP_REG1, TEMP_REG2);
 			if (compute_rem)
-				la_mod_w(&a, LA_T3, TEMP_REG1, TEMP_REG2);
+				la_mod_w(&a, rem, TEMP_REG1, TEMP_REG2);
 		}
 		else
 		{
-			la_div_wu(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+			la_div_wu(&a, quot, TEMP_REG1, TEMP_REG2);
 			if (compute_rem)
-				la_mod_wu(&a, LA_T3, TEMP_REG1, TEMP_REG2);
+				la_mod_wu(&a, rem, TEMP_REG1, TEMP_REG2);
 		}
-		zero_extend32(a, TEMP_REG3);
+		zero_extend32(a, quot);
 		if (compute_rem)
-			zero_extend32(a, LA_T3);
+			zero_extend32(a, rem);
 	}
 	else
 	{
 		if (Signed)
 		{
-			la_div_d(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+			la_div_d(&a, quot, TEMP_REG1, TEMP_REG2);
 			if (compute_rem)
-				la_mod_d(&a, LA_T3, TEMP_REG1, TEMP_REG2);
+				la_mod_d(&a, rem, TEMP_REG1, TEMP_REG2);
 		}
 		else
 		{
-			la_div_du(&a, TEMP_REG3, TEMP_REG1, TEMP_REG2);
+			la_div_du(&a, quot, TEMP_REG1, TEMP_REG2);
 			if (compute_rem)
-				la_mod_du(&a, LA_T3, TEMP_REG1, TEMP_REG2);
+				la_mod_du(&a, rem, TEMP_REG1, TEMP_REG2);
 		}
 	}
 
-	mov_param_reg(a, inst.size(), dstp, TEMP_REG3);
+	write_result(a, inst.size(), dstp, quot, inst.size() == 4);
 	if (compute_rem)
-		mov_param_reg(a, inst.size(), edstp, LA_T3);
+		write_result(a, inst.size(), edstp, rem, inst.size() == 4);
 
 	if (inst.flags())
 	{
-		emit_flags_nz(a, TEMP_REG3, inst.size() * 8, FLAG_TMP_REG);
-		merge_flags(a, FLAG_Z | FLAG_S);
+		emit_flags_nz(a, quot, inst.size() * 8, inst.flags(), FLAG_TMP_REG);
+		merge_flags(a, inst.flags());
 	}
 	la_b(&a, la_label(&a, &done));
 
@@ -5288,10 +5412,8 @@ void drcbe_la64::op_ftoint(lagoon_assembler_t &a, const uml::instruction &inst)
 	assert(roundp.is_rounding());
 
 	const uint32_t dstsize = 1u << sizep.size();
-	la_fpr_t const srcreg = TEMPF_REG1;
-	la_fpr_t const dstreg = TEMPF_REG2;
-
-	mov_float_reg_param(a, inst.size(), srcreg, srcp);
+	la_fpr_t const srcreg = srcp.select_register(TEMPF_REG1);
+	la_fpr_t const tmpreg = TEMPF_REG2;
 
 	auto emit_convert = [&](int rounding)
 	{
@@ -5299,34 +5421,34 @@ void drcbe_la64::op_ftoint(lagoon_assembler_t &a, const uml::instruction &inst)
 		{
 			if (dstsize == 8)
 			{
-				if (rounding == 0) la_ftintrz_l_s(&a, dstreg, srcreg);
-				else if (rounding == 1) la_ftintrne_l_s(&a, dstreg, srcreg);
-				else if (rounding == 2) la_ftintrp_l_s(&a, dstreg, srcreg);
-				else la_ftintrm_l_s(&a, dstreg, srcreg);
+				if (rounding == 0) la_ftintrz_l_s(&a, tmpreg, srcreg);
+				else if (rounding == 1) la_ftintrne_l_s(&a, tmpreg, srcreg);
+				else if (rounding == 2) la_ftintrp_l_s(&a, tmpreg, srcreg);
+				else la_ftintrm_l_s(&a, tmpreg, srcreg);
 			}
 			else
 			{
-				if (rounding == 0) la_ftintrz_w_s(&a, dstreg, srcreg);
-				else if (rounding == 1) la_ftintrne_w_s(&a, dstreg, srcreg);
-				else if (rounding == 2) la_ftintrp_w_s(&a, dstreg, srcreg);
-				else la_ftintrm_w_s(&a, dstreg, srcreg);
+				if (rounding == 0) la_ftintrz_w_s(&a, tmpreg, srcreg);
+				else if (rounding == 1) la_ftintrne_w_s(&a, tmpreg, srcreg);
+				else if (rounding == 2) la_ftintrp_w_s(&a, tmpreg, srcreg);
+				else la_ftintrm_w_s(&a, tmpreg, srcreg);
 			}
 		}
 		else
 		{
 			if (dstsize == 8)
 			{
-				if (rounding == 0) la_ftintrz_l_d(&a, dstreg, srcreg);
-				else if (rounding == 1) la_ftintrne_l_d(&a, dstreg, srcreg);
-				else if (rounding == 2) la_ftintrp_l_d(&a, dstreg, srcreg);
-				else la_ftintrm_l_d(&a, dstreg, srcreg);
+				if (rounding == 0) la_ftintrz_l_d(&a, tmpreg, srcreg);
+				else if (rounding == 1) la_ftintrne_l_d(&a, tmpreg, srcreg);
+				else if (rounding == 2) la_ftintrp_l_d(&a, tmpreg, srcreg);
+				else la_ftintrm_l_d(&a, tmpreg, srcreg);
 			}
 			else
 			{
-				if (rounding == 0) la_ftintrz_w_d(&a, dstreg, srcreg);
-				else if (rounding == 1) la_ftintrne_w_d(&a, dstreg, srcreg);
-				else if (rounding == 2) la_ftintrp_w_d(&a, dstreg, srcreg);
-				else la_ftintrm_w_d(&a, dstreg, srcreg);
+				if (rounding == 0) la_ftintrz_w_d(&a, tmpreg, srcreg);
+				else if (rounding == 1) la_ftintrne_w_d(&a, tmpreg, srcreg);
+				else if (rounding == 2) la_ftintrp_w_d(&a, tmpreg, srcreg);
+				else la_ftintrm_w_d(&a, tmpreg, srcreg);
 			}
 		}
 	};
@@ -5338,55 +5460,31 @@ void drcbe_la64::op_ftoint(lagoon_assembler_t &a, const uml::instruction &inst)
 	}
 	else
 	{
-		load_address(a, TEMP_REG1, uintptr_t(&m_state.fmod));
-		la_ld_bu(&a, TEMP_REG1, TEMP_REG1, 0);
-		la_andi(&a, TEMP_REG1, TEMP_REG1, 3);
-
-		lagoon_label_t l_trunc = {};
-		lagoon_label_t l_round = {};
-		lagoon_label_t l_ceil = {};
-		lagoon_label_t l_floor = {};
-		lagoon_label_t l_done = {};
-
-		la_beqz(&a, TEMP_REG1, la_label(&a, &l_trunc));
-		la_addi_d(&a, TEMP_REG2, LA_ZERO, 1);
-		la_beq(&a, TEMP_REG1, TEMP_REG2, la_label(&a, &l_round));
-		la_addi_d(&a, TEMP_REG2, LA_ZERO, 2);
-		la_beq(&a, TEMP_REG1, TEMP_REG2, la_label(&a, &l_ceil));
-		la_b(&a, la_label(&a, &l_floor));
-
-		la_bind(&a, &l_trunc);
-		emit_convert(0);
-		la_b(&a, la_label(&a, &l_done));
-
-		la_bind(&a, &l_round);
-		emit_convert(1);
-		la_b(&a, la_label(&a, &l_done));
-
-		la_bind(&a, &l_ceil);
-		emit_convert(2);
-		la_b(&a, la_label(&a, &l_done));
-
-		la_bind(&a, &l_floor);
-		emit_convert(3);
-
-		la_bind(&a, &l_done);
-		la_label_free(&a, &l_trunc);
-		la_label_free(&a, &l_round);
-		la_label_free(&a, &l_ceil);
-		la_label_free(&a, &l_floor);
-		la_label_free(&a, &l_done);
+		// the native FCSR is kept in sync with m_state.fmod, so the implicit
+		// rounding-mode forms can be used directly instead of a branch tree
+		if (inst.size() == 4)
+		{
+			if (dstsize == 8)
+				la_ftint_l_s(&a, tmpreg, srcreg);
+			else
+				la_ftint_w_s(&a, tmpreg, srcreg);
+		}
+		else
+		{
+			if (dstsize == 8)
+				la_ftint_l_d(&a, tmpreg, srcreg);
+			else
+				la_ftint_w_d(&a, tmpreg, srcreg);
+		}
 	}
 
+	la_gpr_t const dstreg = dstp.select_register(TEMP_REG3);
 	if (dstsize == 8)
-		la_movfr2gr_d(&a, TEMP_REG3, dstreg);
+		la_movfr2gr_d(&a, dstreg, tmpreg);
 	else
-	{
-		la_movfr2gr_s(&a, TEMP_REG3, dstreg);
-		zero_extend32(a, TEMP_REG3);
-	}
+		la_movfr2gr_s(&a, dstreg, tmpreg);
 
-	mov_param_reg(a, dstsize, dstp, TEMP_REG3);
+	write_result(a, dstsize, dstp, dstreg);
 }
 
 void drcbe_la64::op_ffrint(lagoon_assembler_t &a, const uml::instruction &inst)
@@ -5486,11 +5584,8 @@ void drcbe_la64::op_fcmp(lagoon_assembler_t &a, const uml::instruction &inst)
 	be_parameter src1p(*this, inst.param(0), PTYPE_MF);
 	be_parameter src2p(*this, inst.param(1), PTYPE_MF);
 
-	la_fpr_t const srcreg1 = TEMPF_REG1;
-	la_fpr_t const srcreg2 = TEMPF_REG2;
-
-	mov_float_reg_param(a, inst.size(), srcreg1, src1p);
-	mov_float_reg_param(a, inst.size(), srcreg2, src2p);
+	la_fpr_t const srcreg1 = src1p.select_register(TEMPF_REG1);
+	la_fpr_t const srcreg2 = src2p.select_register(TEMPF_REG2);
 
 	if (inst.size() == 4)
 	{
@@ -5505,25 +5600,32 @@ void drcbe_la64::op_fcmp(lagoon_assembler_t &a, const uml::instruction &inst)
 		la_fcmp_ceq_d(&a, LA_FCC2, srcreg1, srcreg2);
 	}
 
-	la_movcf2gr(&a, TEMP_REG1, LA_FCC1);
-	la_movcf2gr(&a, TEMP_REG2, LA_FCC2);
-	la_slli_d(&a, TEMP_REG2, TEMP_REG2, uml::FLAG_BIT_Z);
-	la_or(&a, TEMP_REG1, TEMP_REG1, TEMP_REG2);
+	uint8_t const flags = inst.flags() & (uml::FLAG_C | uml::FLAG_Z | uml::FLAG_U);
+	if (!flags)
+		return;
 
-	la_movcf2gr(&a, TEMP_REG2, LA_FCC0);
-	lagoon_label_t ordered = {};
-	lagoon_label_t done = {};
-	la_beqz(&a, TEMP_REG2, la_label(&a, &ordered));
+	// unordered inputs make clt/ceq false, so the three results can simply
+	// be shifted into place without a select branch
+	if (flags & uml::FLAG_C)
+		la_movcf2gr(&a, FLAG_TMP_REG, LA_FCC1);
+	else
+		la_move(&a, FLAG_TMP_REG, LA_ZERO);
 
-	la_addi_d(&a, FLAGS_REG, LA_ZERO, uml::FLAG_U);
-	la_b(&a, la_label(&a, &done));
+	if (flags & uml::FLAG_Z)
+	{
+		la_movcf2gr(&a, SCRATCH_REG1, LA_FCC2);
+		la_slli_d(&a, SCRATCH_REG1, SCRATCH_REG1, uml::FLAG_BIT_Z);
+		la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, SCRATCH_REG1);
+	}
 
-	la_bind(&a, &ordered);
-	la_move(&a, FLAGS_REG, TEMP_REG1);
+	if (flags & uml::FLAG_U)
+	{
+		la_movcf2gr(&a, SCRATCH_REG1, LA_FCC0);
+		la_slli_d(&a, SCRATCH_REG1, SCRATCH_REG1, uml::FLAG_BIT_U);
+		la_or(&a, FLAG_TMP_REG, FLAG_TMP_REG, SCRATCH_REG1);
+	}
 
-	la_bind(&a, &done);
-	la_label_free(&a, &ordered);
-	la_label_free(&a, &done);
+	merge_flags(a, flags);
 }
 
 template <int Opcode> void drcbe_la64::op_float_alu(lagoon_assembler_t &a, const uml::instruction &inst)
